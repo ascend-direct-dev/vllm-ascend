@@ -16,9 +16,11 @@ from vllm.distributed import (
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
+    CacheRegion,
     ChunkedTokenDatabase,
     KeyMetadata,
     LayerMultiBlockReqMeta,
@@ -55,6 +57,7 @@ class KVPoolWorker:
         self,
         vllm_config: VllmConfig,
         use_layerwize: bool,
+        kv_cache_config: KVCacheConfig | None = None,
     ):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -64,6 +67,10 @@ class KVPoolWorker:
             self.use_mla = True
         self.use_sparse = hasattr(model_config.hf_text_config, "index_topk")
         self.use_layerwise = use_layerwize
+        self.kv_cache_config = kv_cache_config
+        self.is_hma = kv_cache_config is not None and len(kv_cache_config.kv_cache_groups) > 1
+        if self.use_layerwise and self.is_hma:
+            raise ValueError("AscendStoreConnector does not support use_layerwise=true with HMA.")
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
@@ -136,6 +143,10 @@ class KVPoolWorker:
                         partitions[-i] += 1
 
         self.token_database = ChunkedTokenDatabase(self.metadata, self.block_size, partitions)
+        self.layer_to_group_id: dict[str, int] = {}
+        self.group_types: list[str] = ["attention"]
+        self.group_block_sizes: list[int] = [self.block_size]
+        self._init_kv_cache_groups()
 
         backend = backend_map.get(self.backend.lower())
         assert backend is not None
@@ -157,6 +168,60 @@ class KVPoolWorker:
         self.kv_recv_thread: KVTransferThread | None = None
 
         self.finished_store_req: set[str] = set()
+
+    def _init_kv_cache_groups(self) -> None:
+        if self.kv_cache_config is None or not self.kv_cache_config.kv_cache_groups:
+            self.token_database.set_kv_cache_groups(self.group_types, self.group_block_sizes)
+            return
+
+        group_types: list[str] = []
+        group_block_sizes: list[int] = []
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            kv_cache_spec = group.kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                if self.is_hma:
+                    raise ValueError("AscendStoreConnector HMA requires explicit per-group KV cache specs.")
+                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+
+            if isinstance(kv_cache_spec, MambaSpec):
+                if kv_cache_spec.mamba_type != "gdn_attention":
+                    if self.is_hma:
+                        raise ValueError(
+                            "AscendStoreConnector HMA only supports MambaSpec(mamba_type='gdn_attention')."
+                        )
+                    group_type = kv_cache_spec.mamba_type
+                else:
+                    group_type = "gdn_attention"
+            elif isinstance(kv_cache_spec, AttentionSpec):
+                group_type = "attention"
+            else:
+                if self.is_hma:
+                    raise ValueError(
+                        f"AscendStoreConnector HMA does not support KV cache spec {type(kv_cache_spec).__name__}."
+                    )
+                group_type = "attention"
+
+            group_types.append(group_type)
+            group_block_sizes.append(kv_cache_spec.block_size)
+            for layer_name in group.layer_names:
+                self.layer_to_group_id[layer_name] = group_id
+
+        self.group_types = group_types or ["attention"]
+        self.group_block_sizes = group_block_sizes or [self.block_size]
+        self.token_database.set_kv_cache_groups(self.group_types, self.group_block_sizes)
+
+    def _uses_hybrid_attn_and_gdn(self) -> bool:
+        return "attention" in self.group_types and "gdn_attention" in self.group_types
+
+    def _get_layer_group_id(self, layer_name: str) -> int:
+        if layer_name in self.layer_to_group_id:
+            return self.layer_to_group_id[layer_name]
+        for known_layer_name, group_id in self.layer_to_group_id.items():
+            if layer_name.endswith(known_layer_name) or known_layer_name.endswith(layer_name):
+                return group_id
+        if self.is_hma:
+            raise ValueError(f"Unable to map KV cache layer {layer_name!r} to a HMA KV cache group.")
+        return 0
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
@@ -186,21 +251,57 @@ class KVPoolWorker:
 
         self.kv_caches = kv_caches
         self.kv_caches_base_addr = []
+        group_regions: dict[int, list[CacheRegion]] = {}
+        layer_base_addrs: dict[str, list[int]] = {}
         ptrs = []
         lengths = []
         length = len(self.block_len)
-        for cache_or_caches in kv_caches.values():
+        for layer_name, cache_or_caches in kv_caches.items():
+            group_id = self._get_layer_group_id(layer_name)
             # Normalize to always be a list of caches
             for i, cache in enumerate(cache_or_caches, 0):
                 base_addr = cache.data_ptr()
-                region_len = self.num_blocks * self.block_len[i % length]
+                tensor_num_blocks = cache.shape[0]
+                if self.kv_cache_config is not None and self.kv_cache_config.num_blocks:
+                    if tensor_num_blocks % self.kv_cache_config.num_blocks != 0:
+                        raise ValueError(
+                            f"KV cache tensor for {layer_name} has {tensor_num_blocks} blocks, "
+                            f"not divisible by configured {self.kv_cache_config.num_blocks} blocks."
+                        )
+                    block_size_scale = tensor_num_blocks // self.kv_cache_config.num_blocks
+                else:
+                    block_size_scale = 1
+                per_physical_block_len = cache[0].numel() * cache.element_size()
+                logical_block_len = per_physical_block_len * block_size_scale
+                region_len = tensor_num_blocks * per_physical_block_len
                 self.kv_caches_base_addr.append(base_addr)
+                layer_base_addrs.setdefault(layer_name, []).append(base_addr)
+                group_regions.setdefault(group_id, []).append(CacheRegion(group_id, base_addr, logical_block_len))
                 ptrs.append(base_addr)
                 lengths.append(region_len)
+
+        if self.kv_cache_config is not None and self._uses_hybrid_attn_and_gdn():
+            ptrs = []
+            lengths = []
+            registered_ptrs: set[int] = set()
+            for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
+                tensor_addrs = []
+                for layer_name in kv_cache_tensor.shared_by:
+                    tensor_addrs.extend(layer_base_addrs.get(layer_name, []))
+                if not tensor_addrs:
+                    continue
+                raw_base_addr = min(tensor_addrs)
+                if raw_base_addr in registered_ptrs:
+                    continue
+                registered_ptrs.add(raw_base_addr)
+                ptrs.append(raw_base_addr)
+                lengths.append(kv_cache_tensor.size)
 
         self.m_store.register_buffer(ptrs, lengths)
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
+        if group_regions:
+            self.token_database.set_kv_cache_regions(group_regions)
 
         if self.use_layerwise:
             self.get_event = threading.Event()
@@ -282,13 +383,14 @@ class KVPoolWorker:
                     size_list = []
                     key_list = []
                     mask_num = request.load_spec.vllm_cached_tokens // self.block_size * self.block_size
-                    for start, end, key in self.token_database.process_tokens(
-                        token_len, request.block_hashes, mask_num
+                    for item in self.token_database.iter_transfer_items(
+                        token_len, request.block_hashes, request.block_ids, mask_num, latest_state_only=True
                     ):
-                        addr, size, _ = self.token_database.prepare_value(start, end, request.block_ids)
-                        key_list.append(key.to_string())
-                        addr_list.append(addr)
-                        size_list.append(size)
+                        key_list.append(item.key.to_string())
+                        addr_list.append(item.addrs)
+                        size_list.append(item.sizes)
+                    if not key_list:
+                        continue
                     key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
                     addr_list_c = (
                         addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
@@ -554,7 +656,7 @@ class KVPoolWorker:
         keys = []
         try:
             starts = []
-            for start, end, key in self.token_database.process_tokens(token_len, block_hashes):
+            for start, end, key in self.token_database.iter_lookup_keys(token_len, block_hashes):
                 if use_layerwise:
                     keys_multi_layer = key.split_layers(self.num_layers)
                     for item in keys_multi_layer:
@@ -591,7 +693,7 @@ class KVPoolWorker:
         keys = []
         try:
             starts = []
-            for start, end, key in self.token_database.process_tokens(token_len, block_hashes):
+            for start, end, key in self.token_database.iter_lookup_keys(token_len, block_hashes):
                 if use_layerwise:
                     keys_multi_layer = key.split_layers(self.num_layers)
                     for item in keys_multi_layer:

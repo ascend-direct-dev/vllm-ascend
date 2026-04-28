@@ -15,15 +15,20 @@ from vllm.v1.serial_utils import MsgpackEncoder
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
+    BlockIdGroups,
     LoadSpec,
     ReqMeta,
     RequestTracker,
+    has_any_block_id,
+    normalize_block_id_groups,
 )
 
 
 class KVPoolScheduler:
-    def __init__(self, vllm_config: "VllmConfig", use_layerwise):
+    def __init__(self, vllm_config: "VllmConfig", use_layerwise, kv_cache_config=None):
         self.use_layerwise = use_layerwise
+        if use_layerwise and kv_cache_config is not None and len(kv_cache_config.kv_cache_groups) > 1:
+            raise ValueError("AscendStoreConnector does not support use_layerwise=true with HMA.")
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.consumer_is_to_load = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_load", False
@@ -51,7 +56,7 @@ class KVPoolScheduler:
         self._discard_partial_chunks = vllm_config.kv_transfer_config.get_from_extra_config(
             "discard_partial_chunks", True
         )
-        self._unfinished_requests: dict[str, tuple[Request, list[int]]] = {}
+        self._unfinished_requests: dict[str, tuple[Request, BlockIdGroups]] = {}
         self._unfinished_request_ids: set[str] = set()
 
     def get_num_new_matched_tokens(
@@ -118,9 +123,9 @@ class KVPoolScheduler:
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
-        local_block_ids = []
+        local_block_ids: BlockIdGroups = []
         if num_external_tokens > 0:
-            local_block_ids = blocks.get_block_ids()[0]
+            local_block_ids = normalize_block_id_groups(blocks.get_block_ids())
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
@@ -179,10 +184,7 @@ class KVPoolScheduler:
             num_tokens_to_compute = request.num_computed_tokens + scheduler_output.num_scheduled_tokens[request.req_id]
             request_tuple = self._unfinished_requests.get(request.req_id)
             request_real = request_tuple[0]  # type: ignore[index]
-            if not isinstance(request.block_ids[0], list):
-                unfolded_block_ids = request.block_ids.copy()
-            else:
-                unfolded_block_ids = request.block_ids[0].copy()
+            unfolded_block_ids = normalize_block_id_groups(request.block_ids)
             request_tracker = RequestTracker(
                 req_id=request.req_id,
                 token_len=num_tokens_to_compute,
@@ -215,13 +217,10 @@ class KVPoolScheduler:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 # resumed request
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids:
+                if not has_any_block_id(new_block_ids):
                     continue
                 if req_id in self._preempted_req_ids:
-                    if isinstance(new_block_ids, tuple):
-                        new_block_ids = new_block_ids[0].copy()
-                    else:
-                        new_block_ids = new_block_ids.copy()
+                    new_block_ids = normalize_block_id_groups(new_block_ids)
                     self._preempted_req_ids.discard(req_id)
                     load_spec = self.load_specs.pop(req_id, None)
                     request_tuple = self._unfinished_requests.get(req_id)
@@ -326,6 +325,13 @@ class KVPoolScheduler:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        return self.request_finished_all_groups(request, (block_ids,))
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
         """
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
@@ -335,10 +341,16 @@ class KVPoolScheduler:
         tracker = self._request_trackers.get(request.request_id)
         if tracker is not None and tracker.num_saved_tokens <= 0:
             return False, None
-        delay_free_blocks = len(block_ids) > 0
+        block_id_groups = normalize_block_id_groups(block_ids)
+        delay_free_blocks = any(block_id_groups)
         if delay_free_blocks:
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("Delaying free of %d blocks for request %s", len(block_ids), request.request_id)
+                logger.debug(
+                    "Delaying free of %d blocks across %d groups for request %s",
+                    sum(len(group) for group in block_id_groups),
+                    len(block_id_groups),
+                    request.request_id,
+                )
         return delay_free_blocks, None
 
 

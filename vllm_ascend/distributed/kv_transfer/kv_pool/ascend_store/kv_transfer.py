@@ -155,25 +155,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
         block_ids = req_meta.block_ids
         req_id = req_meta.req_id
         current_event = req_meta.current_event
-        starts = []
-        ends = []
-        keys = []
-        block_hashes = []
         if req_id not in self.stored_requests:
             self.request_queue.task_done()
             return
 
-        for index, (start, end, key) in enumerate(self.token_database.process_tokens(token_len, req_meta.block_hashes)):
-            starts.append(start)
-            ends.append(end)
-            keys.append(key.to_string())
-            block_hashes.append(req_meta.block_hashes[index])
+        transfer_items = list(self.token_database.iter_transfer_items(token_len, req_meta.block_hashes, block_ids))
 
         if not self.dcp_size > 1:
-            starts = starts[self.tp_rank % self.put_step :: self.put_step]
-            ends = ends[self.tp_rank % self.put_step :: self.put_step]
-            keys = keys[self.tp_rank % self.put_step :: self.put_step]
-            block_hashes = block_hashes[self.tp_rank % self.put_step :: self.put_step]
+            transfer_items = transfer_items[self.tp_rank % self.put_step :: self.put_step]
+
+        keys = [item.key.to_string() for item in transfer_items]
 
         if not keys:
             self.dec_stored_request(req_id)
@@ -186,16 +177,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.dec_stored_request(req_id)
             return
 
-        starts = [starts[index] for index in missing_indices]
-        ends = [ends[index] for index in missing_indices]
+        transfer_items = [transfer_items[index] for index in missing_indices]
         keys = [keys[index] for index in missing_indices]
-        block_hashes = [block_hashes[index] for index in missing_indices]
+        block_hashes = [req_meta.block_hashes[item.block_hash_index] for item in transfer_items]
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s",
                 len(keys),
-                token_len // self.block_size,
+                len(transfer_items),
                 len(missing_indices),
                 req_id,
             )
@@ -212,14 +202,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
             stored_events: list[BlockStored] = []
             prev_key = None
             new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
-            for index, start in enumerate(starts):
-                addr, size, _ = self.token_database.prepare_value(start, ends[index], block_ids)
-                addrs.append(addr)
-                sizes.append(size)
+            for index, item in enumerate(transfer_items):
+                addrs.append(item.addrs)
+                sizes.append(item.sizes)
 
                 # Create KV event
                 if self.enable_kv_event:
-                    token_ids = req_meta.token_ids[start : ends[index]] if req_meta.token_ids is not None else None
+                    token_ids = (
+                        req_meta.token_ids[item.start : item.end] if req_meta.token_ids is not None else None
+                    )
                     stored_event = BlockStored(
                         block_hashes=[new_block_hashes[index]],
                         parent_block_hash=prev_key,
@@ -273,11 +264,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         addr_list = []
         size_list = []
         key_list = []
-        for start, end, key in self.token_database.process_tokens(token_len, req_meta.block_hashes, mask_num):
-            addr, size, _ = self.token_database.prepare_value(start, end, req_meta.block_ids)
-            key_list.append(key.to_string())
-            addr_list.append(addr)
-            size_list.append(size)
+        for item in self.token_database.iter_transfer_items(
+            token_len, req_meta.block_hashes, req_meta.block_ids, mask_num, latest_state_only=True
+        ):
+            key_list.append(item.key.to_string())
+            addr_list.append(item.addrs)
+            size_list.append(item.sizes)
+        if not key_list:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
         key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
         addr_list_c = addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
         size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]

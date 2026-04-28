@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -8,6 +10,43 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import NewRequestData
+
+
+BlockIdGroups = list[list[int]]
+
+
+def normalize_block_id_groups(
+    block_ids: tuple[list[int], ...] | list[list[int]] | list[int] | None,
+) -> BlockIdGroups:
+    if block_ids is None or len(block_ids) == 0:
+        return []
+    first_group = block_ids[0]
+    if isinstance(first_group, (list, tuple)):
+        return [list(group) for group in block_ids]  # type: ignore[arg-type]
+    return [list(block_ids)]  # type: ignore[list-item]
+
+
+def has_any_block_id(block_ids: tuple[list[int], ...] | list[list[int]] | list[int] | None) -> bool:
+    return any(group for group in normalize_block_id_groups(block_ids))
+
+
+@dataclass(frozen=True)
+class CacheRegion:
+    group_id: int
+    base_addr: int
+    block_len: int
+
+
+@dataclass(frozen=True)
+class TransferItem:
+    start: int
+    end: int
+    key: PoolKey
+    addrs: list[int]
+    sizes: list[int]
+    block_id: int
+    block_hash_index: int
+    group_id: int
 
 
 # Parameters related to the key
@@ -30,8 +69,21 @@ class KeyMetadata:
 class PoolKey:
     key_metadata: KeyMetadata
     chunk_hash: str
+    group_id: int | None = field(default=None, kw_only=True)
+    group_type: str | None = field(default=None, kw_only=True)
 
     def __hash__(self):
+        if self.group_id is None:
+            return hash(
+                (
+                    self.key_metadata.model_name,
+                    self.key_metadata.head_or_tp_rank,
+                    self.key_metadata.pcp_rank,
+                    self.key_metadata.dcp_rank,
+                    self.key_metadata.pp_rank,
+                    self.chunk_hash,
+                )
+            )
         return hash(
             (
                 self.key_metadata.model_name,
@@ -39,16 +91,26 @@ class PoolKey:
                 self.key_metadata.pcp_rank,
                 self.key_metadata.dcp_rank,
                 self.key_metadata.pp_rank,
+                self.group_id,
+                self.group_type,
                 self.chunk_hash,
             )
         )
 
     def to_string(self):
+        if self.group_id is None:
+            return (
+                f"{self.key_metadata.model_name}"
+                f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
+                f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
+                f"@pp_rank:{self.key_metadata.pp_rank}@{self.chunk_hash}"
+            )
+        group_suffix = "" if self.group_id is None else f"@group:{self.group_id}:{self.group_type}"
         return (
             f"{self.key_metadata.model_name}"
             f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
             f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
-            f"@pp_rank:{self.key_metadata.pp_rank}@{self.chunk_hash}"
+            f"@pp_rank:{self.key_metadata.pp_rank}{group_suffix}@{self.chunk_hash}"
         )
 
     def split_layers(self, num_layers: int) -> list["LayerPoolKey"]:
@@ -60,6 +122,8 @@ class PoolKey:
                     self.key_metadata,
                     self.chunk_hash,
                     layer_id,
+                    group_id=self.group_id,
+                    group_type=self.group_type,
                 )
             )
         return keys
@@ -72,22 +136,44 @@ class LayerPoolKey(PoolKey):
     layer_id: int
 
     def __hash__(self):
+        if self.group_id is None:
+            return hash(
+                (
+                    self.key_metadata.model_name,
+                    self.key_metadata.head_or_tp_rank,
+                    self.key_metadata.pcp_rank,
+                    self.key_metadata.dcp_rank,
+                    self.chunk_hash,
+                    self.layer_id,
+                )
+            )
         return hash(
             (
                 self.key_metadata.model_name,
                 self.key_metadata.head_or_tp_rank,
                 self.key_metadata.pcp_rank,
                 self.key_metadata.dcp_rank,
+                self.key_metadata.pp_rank,
+                self.group_id,
+                self.group_type,
                 self.chunk_hash,
                 self.layer_id,
             )
         )
 
     def to_string(self):
+        if self.group_id is None:
+            return (
+                f"{self.key_metadata.model_name}"
+                f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
+                f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}@{self.chunk_hash}@{self.layer_id}"
+            )
+        group_suffix = "" if self.group_id is None else f"@group:{self.group_id}:{self.group_type}"
         return (
             f"{self.key_metadata.model_name}"
             f"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}"
-            f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}@{self.chunk_hash}@{self.layer_id}"
+            f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
+            f"@pp_rank:{self.key_metadata.pp_rank}{group_suffix}@{self.chunk_hash}@{self.layer_id}"
         )
 
 
@@ -98,24 +184,67 @@ class ChunkedTokenDatabase:
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
         self.partitions = partitions
+        self.group_types: list[str] = ["attention"]
+        self.group_block_sizes: list[int] = [block_size]
+        self.group_regions: dict[int, list[CacheRegion]] = {}
 
-    def _make_key_by_hash(self, chunk_hash: str, layer_id: int | None = None):
+    def _make_key_by_hash(self, chunk_hash: str, layer_id: int | None = None, group_id: int | None = None):
         assert self.metadata is not None
+        group_type = self.group_types[group_id] if group_id is not None and group_id < len(self.group_types) else None
         return PoolKey(
             self.metadata,
             chunk_hash,
+            group_id=group_id if self._uses_group_namespace() else None,
+            group_type=group_type if self._uses_group_namespace() else None,
         )
+
+    def _uses_group_namespace(self) -> bool:
+        return len(self.group_types) > 1
 
     def set_kv_caches_base_addr(self, kv_caches_base_addr: list[int]):
         self.kv_caches_base_addr = kv_caches_base_addr
+        self._refresh_default_regions()
 
     def set_block_len(self, block_len: list[int]):
         self.block_len = block_len
+        self._refresh_default_regions()
 
-    def prepare_value(self, start: int, end: int, block_ids: list[int]):
+    def set_kv_cache_groups(self, group_types: list[str], group_block_sizes: list[int]):
+        self.group_types = group_types or ["attention"]
+        self.group_block_sizes = group_block_sizes or [self.block_size]
+        self._refresh_default_regions()
+
+    def set_kv_cache_regions(self, group_regions: dict[int, list[CacheRegion]]):
+        self.group_regions = {group_id: list(regions) for group_id, regions in group_regions.items()}
+
+    def _refresh_default_regions(self):
+        if not self.kv_caches_base_addr or not self.block_len or self._uses_group_namespace():
+            return
+        length = len(self.block_len)
+        self.group_regions = {
+            0: [
+                CacheRegion(0, base_addr, self.block_len[index % length])
+                for index, base_addr in enumerate(self.kv_caches_base_addr)
+            ]
+        }
+
+    def prepare_value(self, start: int, end: int, block_ids: tuple[list[int], ...] | list[list[int]] | list[int]):
+        block_id_groups = normalize_block_id_groups(block_ids)
+        if self._uses_group_namespace():
+            block_hashes = [""] * (start // self.block_size + 1)
+            items = self.iter_transfer_items(end, block_hashes, block_id_groups, start_token=start)
+            addrs: list[int] = []
+            sizes: list[int] = []
+            block_id = -1
+            for item in items:
+                addrs.extend(item.addrs)
+                sizes.extend(item.sizes)
+                block_id = item.block_id
+            return addrs, sizes, block_id
         addr_list = []
         size_list = []
-        block_id = block_ids[start // self.block_size]
+        block_ids_0 = block_id_groups[0] if block_id_groups else []
+        block_id = block_ids_0[start // self.block_size]
         length = len(self.block_len)
         for index, base_addr in enumerate(self.kv_caches_base_addr):
             addr = base_addr + block_id * self.block_len[index % length]
@@ -124,8 +253,15 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
-    def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
-        block_id = block_ids[start // self.block_size]
+    def prepare_value_layer(
+        self,
+        start: int,
+        end: int,
+        block_ids: tuple[list[int], ...] | list[list[int]] | list[int],
+        layer_id: int,
+    ):
+        block_ids_0 = normalize_block_id_groups(block_ids)[0]
+        block_id = block_ids_0[start // self.block_size]
         addr_list = []
         size_list = []
         length = len(self.block_len)
@@ -135,6 +271,73 @@ class ChunkedTokenDatabase:
             addr_list.append(addr)
             size_list.append(size)
         return addr_list, size_list
+
+    def iter_lookup_keys(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash] | list[str],
+        mask_num: int = 0,
+    ) -> Iterable[tuple[int, int, PoolKey]]:
+        if not self._uses_group_namespace():
+            yield from self.process_tokens(token_len, block_hashes, mask_num)
+            return
+        for start, end, key in self.process_tokens(token_len, block_hashes, mask_num):
+            for group_id in range(len(self.group_types)):
+                yield start, end, self._make_key_by_hash(key.chunk_hash, group_id=group_id)
+
+    def iter_transfer_items(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash] | list[str],
+        block_ids: tuple[list[int], ...] | list[list[int]] | list[int],
+        mask_num: int = 0,
+        start_token: int | None = None,
+        latest_state_only: bool = False,
+    ) -> Iterable[TransferItem]:
+        block_id_groups = normalize_block_id_groups(block_ids)
+        if not block_id_groups:
+            return
+        token_iter = self.process_tokens(token_len, block_hashes, mask_num)
+        for hash_index, (start, end, base_key) in enumerate(token_iter):
+            if start_token is not None and start != start_token:
+                continue
+            for group_id, group_block_ids in enumerate(block_id_groups):
+                if not group_block_ids:
+                    continue
+                group_type = self.group_types[group_id] if group_id < len(self.group_types) else "attention"
+                if latest_state_only and group_type == "gdn_attention" and end < token_len:
+                    continue
+                group_block_size = (
+                    self.group_block_sizes[group_id] if group_id < len(self.group_block_sizes) else self.block_size
+                )
+                block_index = start // group_block_size
+                if block_index >= len(group_block_ids):
+                    if group_type == "gdn_attention" and len(group_block_ids) == 1:
+                        block_index = 0
+                    else:
+                        continue
+                block_id = group_block_ids[block_index]
+                addrs = []
+                sizes = []
+                regions = self.group_regions.get(group_id, [])
+                for region in regions:
+                    addr = region.base_addr + block_id * region.block_len
+                    if group_type == "gdn_attention":
+                        size = region.block_len
+                    else:
+                        size = int(region.block_len / group_block_size * (end - start))
+                    addrs.append(addr)
+                    sizes.append(size)
+                yield TransferItem(
+                    start=start,
+                    end=end,
+                    key=self._make_key_by_hash(base_key.chunk_hash, group_id=group_id),
+                    addrs=addrs,
+                    sizes=sizes,
+                    block_id=block_id,
+                    block_hash_index=hash_index,
+                    group_id=group_id,
+                )
 
     def process_tokens(
         self,
@@ -227,7 +430,7 @@ class RequestTracker:
     # NOTE: allocated blocks could be more than the number of tokens
     # FIXME: need to check whether the block ids will be changed after
     #        preemption
-    allocated_block_ids: list[int]
+    allocated_block_ids: BlockIdGroups
 
     # The number of tokens that has been savd
     num_saved_tokens: int = 0
@@ -250,12 +453,7 @@ class RequestTracker:
                 local cache hit) and new tokens that will be scheduled.
 
         """
-        unfolded_block_ids = []
-
-        if not isinstance(new_request.block_ids[0], list):
-            unfolded_block_ids = new_request.block_ids.copy()
-        else:
-            unfolded_block_ids = new_request.block_ids[0].copy()
+        unfolded_block_ids = normalize_block_id_groups(new_request.block_ids)
 
         return RequestTracker(
             req_id=new_request.req_id,
@@ -267,20 +465,16 @@ class RequestTracker:
 
     def update(
         self,
-        new_block_ids: tuple[list[int], ...] | list[int],
+        new_block_ids: tuple[list[int], ...] | list[list[int]] | list[int],
     ) -> None:
         """Update the request tracker when a running request is
         scheduled again
         """
-        if len(new_block_ids) == 0:
-            new_block_ids = []
-        elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
-        elif isinstance(new_block_ids, list):
-            pass
-        else:
-            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
-        self.allocated_block_ids.extend(new_block_ids)
+        new_block_id_groups = normalize_block_id_groups(new_block_ids)
+        while len(self.allocated_block_ids) < len(new_block_id_groups):
+            self.allocated_block_ids.append([])
+        for group_id, group_block_ids in enumerate(new_block_id_groups):
+            self.allocated_block_ids[group_id].extend(group_block_ids)
 
 
 @dataclass
@@ -290,7 +484,7 @@ class ReqMeta:
     # Number of tokens in this chunk
     token_len_chunk: int
 
-    block_ids: list[int]
+    block_ids: BlockIdGroups
 
     block_hashes: list[BlockHash]
 
@@ -403,7 +597,7 @@ class LayerMultiBlockReqMeta:
     keys: list[LayerPoolKey]
     starts: list[int]
     ends: list[int]
-    block_ids: list[int]
+    block_ids: BlockIdGroups
     layer_id: int
     is_last_chunk: bool | None = True
     current_event: torch.npu.Event | None = None

@@ -31,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.parallel_state import (
     get_decode_context_model_parallel_rank,
@@ -44,7 +45,12 @@ from vllm.distributed.utils import get_pp_indices
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.request import RequestStatus
 
 from vllm_ascend import envs as ascend_envs
@@ -64,6 +70,29 @@ if TYPE_CHECKING:
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
 
+# Block ids organized by KV cache group: one inner list per KV cache group.
+# For non-HMA (single group) models this is a list with a single inner list.
+BlockIdGroups = list[list[int]]
+
+
+def normalize_block_id_groups(
+    block_ids: "tuple[list[int], ...] | list[list[int]] | list[int] | None",
+) -> BlockIdGroups:
+    """Normalize block ids into a list of per-group block id lists.
+
+    Accepts a flat list (single group), a tuple/list of per-group lists, or None.
+    """
+    if block_ids is None or len(block_ids) == 0:
+        return []
+    first_group = block_ids[0]
+    if isinstance(first_group, (list, tuple)):
+        return [list(group) for group in block_ids]  # type: ignore[arg-type]
+    return [list(block_ids)]  # type: ignore[list-item]
+
+
+def has_any_block_id(block_ids: "tuple[list[int], ...] | list[list[int]] | list[int] | None") -> bool:
+    return any(group for group in normalize_block_id_groups(block_ids))
+
 
 class RemotePortInfo(TypedDict):
     num: int
@@ -80,9 +109,11 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
 
 @dataclass
 class ReqMeta:
-    local_block_ids: list[int]
+    # Under HMA these are grouped block ids (list per KV cache group); otherwise
+    # a flat list of block ids for the single KV cache group.
+    local_block_ids: list[int] | list[list[int]]
     num_external_tokens: int
-    remote_block_ids: list[int]
+    remote_block_ids: list[int] | list[list[int]]
     remote_host: str
     remote_port: int
     remote_engine_id: str
@@ -317,6 +348,11 @@ class KVCacheRecvingThread(threading.Thread):
         vllm_config: VllmConfig,
         kv_caches: dict[str, Any],
         prefill_pp_layer_partition: str | None = None,
+        is_hma: bool = False,
+        num_kv_cache_groups: int = 1,
+        region_group_ids: list[int] | None = None,
+        region_block_len: list[int] | None = None,
+        group_types: list[str] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -335,6 +371,13 @@ class KVCacheRecvingThread(threading.Thread):
         self.block_len = block_len
         # TODO(jianzs): find a better way to detect MLA.
         self.use_mla = len(block_len) == 2
+
+        # HMA (multiple KV cache groups) metadata.
+        self.is_hma = is_hma
+        self.num_kv_cache_groups = num_kv_cache_groups
+        self.region_group_ids = region_group_ids or []
+        self.region_block_len = region_block_len or []
+        self.group_types = group_types or ["attention"]
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=32)
@@ -375,8 +418,8 @@ class KVCacheRecvingThread(threading.Thread):
         self,
         request_id: str,
         remote_request_id: str,
-        local_block_ids: list[int],
-        remote_block_ids: list[int],
+        local_block_ids: list[int] | list[list[int]],
+        remote_block_ids: list[int] | list[list[int]],
         remote_engine_id: str,
         remote_host: str,
         remote_handshake_port: int,
@@ -444,7 +487,7 @@ class KVCacheRecvingThread(threading.Thread):
         finally:
             self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
             if all_task_done:
-                if len(req_meta["local_block_ids"]) > 0:
+                if has_any_block_id(req_meta["local_block_ids"]):
                     self.task_tracker.update_done_task_count(request_id)
                 if request_id in self.proc_not_transfer_request:
                     del self.proc_not_transfer_request[request_id]
@@ -470,6 +513,10 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _transfer_kv_cache(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
+        if self.is_hma:
+            self._transfer_kv_cache_hma(req_meta)
+            return
+
         remote_request_id = req_meta["remote_request_id"]
         remote_block_ids = req_meta["remote_block_ids"]
         local_block_ids = req_meta["local_block_ids"]
@@ -581,6 +628,107 @@ class KVCacheRecvingThread(threading.Thread):
                     self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, False, need_nz_cache)
             else:
                 self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
+
+    def _transfer_kv_cache_hma(self, req_meta: dict[str, Any]):
+        """HMA (multiple KV cache groups) transfer.
+
+        Only the standard path is supported (TP==TP so tp_num_need_pulls==1, no
+        PP, no PCP/DCP). ``local_block_ids``/``remote_block_ids`` are organized
+        per KV cache group; each registered cache region carries its own group
+        id and byte length, so we transfer each region using its group's block
+        ids and the group's per-block byte length.
+        """
+        remote_request_id = req_meta["remote_request_id"]
+        remote_engine_id = req_meta["remote_engine_id"]
+        remote_host = req_meta["remote_host"]
+        remote_handshake_port = req_meta["remote_handshake_port"]
+
+        local_block_id_groups = normalize_block_id_groups(req_meta["local_block_ids"])
+        remote_block_id_groups = normalize_block_id_groups(req_meta["remote_block_ids"])
+
+        # Full prefix cache hit across all groups: nothing to read, just notify.
+        if not has_any_block_id(local_block_id_groups):
+            return
+
+        # Per-group contiguous block id pairs (remote, local), with per-group
+        # tail alignment of remote blocks to the number of local blocks.
+        num_groups = max(len(local_block_id_groups), len(remote_block_id_groups))
+        grouped_remote_by_group: list[list[Any]] = [[] for _ in range(num_groups)]
+        grouped_local_by_group: list[list[Any]] = [[] for _ in range(num_groups)]
+        total_blocks = 0
+        for group_id in range(num_groups):
+            local_g = local_block_id_groups[group_id] if group_id < len(local_block_id_groups) else []
+            remote_g = remote_block_id_groups[group_id] if group_id < len(remote_block_id_groups) else []
+            num_local = len(local_g)
+            if num_local == 0:
+                continue
+            num_remote = len(remote_g)
+            assert num_local <= num_remote, (
+                f"group {group_id}: num_local_blocks({num_local}) > num_remote_blocks({num_remote})"
+            )
+            if num_local < num_remote:
+                remote_g = remote_g[-num_local:]
+            grouped_remote_g, grouped_local_g = group_concurrent_contiguous(remote_g, local_g)
+            grouped_remote_by_group[group_id] = grouped_remote_g
+            grouped_local_by_group[group_id] = grouped_local_g
+            total_blocks += num_local
+
+        # Check if we have the remote metadata cached.
+        if (
+            remote_engine_id not in self.kv_caches_base_addr
+            or remote_handshake_port not in self.kv_caches_base_addr[remote_engine_id]
+        ):
+            self._get_remote_metadata(remote_host, remote_handshake_port)
+
+        remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
+        local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
+        assert len(local_kv_caches_base_addrs) == len(self.region_group_ids) == len(self.region_block_len), (
+            "HMA region metadata is not aligned with local kv cache base addresses."
+        )
+        assert len(remote_kv_caches_base_addrs) == len(local_kv_caches_base_addrs), (
+            "HMA remote/local kv cache base address counts differ."
+        )
+
+        remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
+        session_id = f"{remote_host}:{remote_transfer_port}"
+
+        req_start_time = time.perf_counter()
+        src_list, dst_list, length_list = [], [], []
+        for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
+            zip(local_kv_caches_base_addrs, remote_kv_caches_base_addrs)
+        ):
+            group_id = self.region_group_ids[k]
+            block_len = self.region_block_len[k]
+            grouped_remote_g = grouped_remote_by_group[group_id]
+            grouped_local_g = grouped_local_by_group[group_id]
+            for remote_block_id, local_block_id in zip(grouped_remote_g, grouped_local_g):
+                src = src_layer_base_addr + local_block_id[0] * block_len
+                dst = dst_layer_base_addr + remote_block_id[0] * block_len
+                length = block_len * len(local_block_id)
+                src_list.append(src)
+                dst_list.append(dst)
+                length_list.append(length)
+
+        if not src_list:
+            return
+
+        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        if ret < 0:
+            logger.error("Mooncake transfer failed for request %s", remote_request_id)
+            raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+
+        req_transfer_elapsed = (time.perf_counter() - req_start_time) * 1000
+        logger.info(
+            "HMA KV cache transfer for request %s took %.2f ms (%d groups, %d blocks)."
+            " local_ip %s local_device_id %s remote_session_id %s",
+            remote_request_id,
+            req_transfer_elapsed,
+            num_groups,
+            total_blocks,
+            get_ip(),
+            self.tp_rank,
+            session_id,
+        )
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
         # Get necessary parameters
@@ -811,20 +959,21 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         )
 
 
-class MooncakeConnector(KVConnectorBase_V1):
+class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         assert vllm_config.kv_transfer_config is not None
+        super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self._connector_metadata = MooncakeConnectorMetadata()
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MooncakeConnectorScheduler | None = MooncakeConnectorScheduler(
-                vllm_config, str(self.engine_id)
+                vllm_config, str(self.engine_id), kv_cache_config
             )
             self.connector_worker: MooncakeConnectorWorker | None = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
-            self.connector_worker = MooncakeConnectorWorker(vllm_config, str(self.engine_id))
+            self.connector_worker = MooncakeConnectorWorker(vllm_config, str(self.engine_id), kv_cache_config)
 
     ############################################################
     # Scheduler Side Methods
@@ -852,6 +1001,14 @@ class MooncakeConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished_all_groups(request, block_ids)
 
     ############################################################
     # Worker Side Methods
@@ -911,7 +1068,7 @@ class MooncakeConnector(KVConnectorBase_V1):
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig | None = None):
         self.vllm_config = vllm_config
         init_ascend_config(vllm_config)
         self.ascend_config = get_ascend_config()
@@ -924,6 +1081,13 @@ class MooncakeConnectorScheduler:
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+        # Hybrid Memory Allocator (HMA): multiple KV cache groups (e.g. attention
+        # + gdn_attention). HMA only supports the standard transfer path.
+        self.kv_cache_config = kv_cache_config
+        self.is_hma = kv_cache_config is not None and len(kv_cache_config.kv_cache_groups) > 1
+        if self.is_hma and (self.pcp_size > 1 or self.dcp_size > 1):
+            raise ValueError("MooncakeConnector does not support HMA together with prefill/decode context parallel.")
         self.max_device_id = (
             vllm_config.parallel_config.tensor_parallel_size
             * vllm_config.parallel_config.data_parallel_size
@@ -995,8 +1159,17 @@ class MooncakeConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             if params.get("remote_block_ids"):
                 if all(p in params for p in ("remote_engine_id", "remote_host", "remote_port", "remote_request_id")):
-                    local_block_ids = blocks.get_unhashed_block_ids() if num_external_tokens > 0 else []
-                    # Get unhashed blocks to pull from remote.
+                    # Get unhashed blocks to pull from remote. Under HMA the
+                    # blocks are organized per KV cache group, so use the
+                    # group-aware accessor (the single-group accessor asserts
+                    # exactly one group).
+                    if num_external_tokens > 0:
+                        if self.is_hma:
+                            local_block_ids = blocks.get_unhashed_block_ids_all_groups()
+                        else:
+                            local_block_ids = blocks.get_unhashed_block_ids()
+                    else:
+                        local_block_ids = []
                     self._reqs_need_recv[request.request_id] = (request, local_block_ids, num_external_tokens)
                 else:
                     logger.warning("Got invalid KVTransferParams: %s. This request will not utilize KVTransfer", params)
@@ -1042,7 +1215,24 @@ class MooncakeConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        return self._request_finished_impl(request, [block_ids])
 
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """
+        HMA variant of request_finished. ``block_ids`` is organized per KV
+        cache group (one inner list per group).
+        """
+        return self._request_finished_impl(request, normalize_block_id_groups(block_ids))
+
+    def _request_finished_impl(
+        self,
+        request: "Request",
+        block_id_groups: BlockIdGroups,
+    ) -> tuple[bool, dict[str, Any] | None]:
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector request_finished, request_status=%s, kv_transfer_params=%s", request.status, params
@@ -1055,10 +1245,20 @@ class MooncakeConnectorScheduler:
         ):
             return False, None
 
-        computed_block_ids = block_ids
-        delay_free_blocks = len(computed_block_ids) > 0
+        # Under HMA, remote_block_ids is sent grouped (list per group) so the
+        # decode worker can pull each group independently. Otherwise keep the
+        # legacy flat list to preserve the wire format for non-HMA peers.
+        if self.is_hma:
+            computed_block_ids: list[int] | BlockIdGroups = block_id_groups
+        else:
+            computed_block_ids = block_id_groups[0] if block_id_groups else []
+        delay_free_blocks = has_any_block_id(block_id_groups)
         if delay_free_blocks:
-            logger.info("Delaying free of %d blocks for request %s", len(computed_block_ids), request.request_id)
+            logger.info(
+                "Delaying free of %d blocks for request %s",
+                sum(len(group) for group in block_id_groups),
+                request.request_id,
+            )
             self._reqs_need_send[request.request_id] = time.time()
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
@@ -1096,7 +1296,7 @@ class MooncakeConnectorScheduler:
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig | None = None):
         self._get_prefill_decode_size(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         if self._prefill_tp_size < self._decode_tp_size:
@@ -1162,6 +1362,85 @@ class MooncakeConnectorWorker:
         self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
 
+        # Hybrid Memory Allocator (HMA): multiple KV cache groups. HMA only
+        # supports the standard transfer path; guard out parallelism combos that
+        # are not handled by the group-aware transfer.
+        self.kv_cache_config = kv_cache_config
+        self.is_hma = kv_cache_config is not None and len(kv_cache_config.kv_cache_groups) > 1
+        self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups) if kv_cache_config is not None else 1
+        self.layer_to_group_id: dict[str, int] = {}
+        self.group_types: list[str] = ["attention"]
+        # Per-region (one entry per registered kv cache buffer) metadata, filled
+        # in register_kv_caches and forwarded to the receiving thread.
+        self.region_group_ids: list[int] = []
+        self.region_block_len: list[int] = []
+        self._init_kv_cache_groups()
+        if self.is_hma:
+            if self.pcp_size * self.dcp_size > 1:
+                raise ValueError(
+                    "MooncakeConnector does not support HMA together with prefill/decode context parallel."
+                )
+            if self._prefill_pp_size > 1 or self.pp_size > 1:
+                raise ValueError("MooncakeConnector does not support HMA together with pipeline parallel.")
+            if self._prefill_tp_size != self._decode_tp_size or self.tp_num_need_pulls != 1:
+                raise ValueError(
+                    "MooncakeConnector does not support HMA together with prefill/decode TP mismatch (GQA pulling)."
+                )
+
+    def _init_kv_cache_groups(self) -> None:
+        """Build the layer -> KV cache group mapping and per-group types.
+
+        Only ``attention`` and ``gdn_attention`` (MambaSpec) groups are
+        supported under HMA, mirroring the AscendStore connector.
+        """
+        if self.kv_cache_config is None or not self.kv_cache_config.kv_cache_groups:
+            return
+
+        group_types: list[str] = []
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            kv_cache_spec = group.kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                if self.is_hma:
+                    raise ValueError("MooncakeConnector HMA requires explicit per-group KV cache specs.")
+                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+
+            if isinstance(kv_cache_spec, MambaSpec):
+                if kv_cache_spec.mamba_type != "gdn_attention":
+                    if self.is_hma:
+                        raise ValueError(
+                            "MooncakeConnector HMA only supports MambaSpec(mamba_type='gdn_attention')."
+                        )
+                    group_type = kv_cache_spec.mamba_type
+                else:
+                    group_type = "gdn_attention"
+            elif isinstance(kv_cache_spec, AttentionSpec):
+                group_type = "attention"
+            else:
+                if self.is_hma:
+                    raise ValueError(
+                        f"MooncakeConnector HMA does not support KV cache spec {type(kv_cache_spec).__name__}."
+                    )
+                group_type = "attention"
+
+            group_types.append(group_type)
+            for layer_name in group.layer_names:
+                self.layer_to_group_id[layer_name] = group_id
+
+        self.group_types = group_types or ["attention"]
+
+    def _get_layer_group_id(self, layer_name: str) -> int:
+        if layer_name in self.layer_to_group_id:
+            return self.layer_to_group_id[layer_name]
+        for known_layer_name, group_id in self.layer_to_group_id.items():
+            if layer_name.endswith(known_layer_name) or known_layer_name.endswith(layer_name):
+                return group_id
+        if self.is_hma:
+            raise ValueError(f"Unable to map KV cache layer {layer_name!r} to a HMA KV cache group.")
+        return 0
+
+    def _uses_hybrid_attn_and_gdn(self) -> bool:
+        return "attention" in self.group_types and "gdn_attention" in self.group_types
+
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config
         prefill_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("prefill", {})
@@ -1226,14 +1505,49 @@ class MooncakeConnectorWorker:
         ptrs = []
         lengths = []
         length = len(self.block_len)
-        for cache_or_caches in kv_caches.values():
+        # Per-region (one entry per base address) group id and byte length, used
+        # by the HMA transfer path. Aligned with kv_caches_base_addr.
+        region_group_ids: list[int] = []
+        region_block_len: list[int] = []
+        layer_base_addrs: dict[str, list[int]] = {}
+        for layer_name, cache_or_caches in kv_caches.items():
+            group_id = self._get_layer_group_id(layer_name) if self.is_hma else 0
             # Normalize to always be a list of caches
             for i, cache in enumerate(cache_or_caches, 0):
                 base_addr = cache.data_ptr()
+                # Generic per-block byte length works for attention (k/v) and
+                # gdn (conv/ssm) caches alike and matches self.block_len.
+                per_block_len = cache[0].numel() * cache.element_size()
                 region_len = self.num_blocks * self.block_len[i % length]
                 kv_caches_base_addr.append(base_addr)
+                region_group_ids.append(group_id)
+                region_block_len.append(per_block_len)
+                layer_base_addrs.setdefault(layer_name, []).append(base_addr)
                 ptrs.append(base_addr)
                 lengths.append(region_len)
+
+        # Hybrid attention + gdn groups share the same KVCacheTensors with
+        # different views, so register by tensor (dedup base addrs) to avoid
+        # overlapping/mis-sized registrations.
+        if self.is_hma and self.kv_cache_config is not None and self._uses_hybrid_attn_and_gdn():
+            ptrs = []
+            lengths = []
+            registered_ptrs: set[int] = set()
+            for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
+                tensor_addrs: list[int] = []
+                for layer_name in kv_cache_tensor.shared_by:
+                    tensor_addrs.extend(layer_base_addrs.get(layer_name, []))
+                if not tensor_addrs:
+                    continue
+                raw_base_addr = min(tensor_addrs)
+                if raw_base_addr in registered_ptrs:
+                    continue
+                registered_ptrs.add(raw_base_addr)
+                ptrs.append(raw_base_addr)
+                lengths.append(kv_cache_tensor.size)
+
+        self.region_group_ids = region_group_ids
+        self.region_block_len = region_block_len
         global_te.register_buffer(ptrs, lengths)
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
@@ -1275,6 +1589,11 @@ class MooncakeConnectorWorker:
                 self.vllm_config,
                 self.kv_caches,
                 self._prefill_pp_layer_partition,
+                is_hma=self.is_hma,
+                num_kv_cache_groups=self.num_kv_cache_groups,
+                region_group_ids=self.region_group_ids,
+                region_block_len=self.region_block_len,
+                group_types=self.group_types,
             )
             self.kv_recv_thread.start()
 
@@ -1537,6 +1856,35 @@ class MooncakeConnectorWorker:
             prefill_tp_size = meta.remote_ptp_size if getattr(meta, "remote_ptp_size", None) else self._prefill_tp_size
             tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
             remote_req_id = meta.remote_request_id
+
+            if self.is_hma:
+                # HMA standard path: TP==TP, no PP, no PCP/DCP. local/remote
+                # block ids are grouped (one list per KV cache group) and the
+                # whole request is pulled from the matching prefill rank in a
+                # single transfer task.
+                chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
+                remote_handshake_port = chosen_rank_list[0] + meta.remote_port
+                remote_host, remote_engine_id = self._get_remote_host_info_by_port(
+                    meta.remote_port,
+                    remote_handshake_port,
+                    meta.remote_host,
+                    meta.remote_engine_id,
+                    meta.remote_multi_nodes_meta_mapping,
+                )
+                assert self.kv_recv_thread is not None
+                self.kv_recv_thread.add_request(
+                    request_id=req_id,
+                    remote_request_id=remote_req_id,
+                    local_block_ids=meta.local_block_ids,
+                    remote_block_ids=meta.remote_block_ids,
+                    remote_engine_id=remote_engine_id,
+                    remote_host=remote_host,
+                    remote_handshake_port=remote_handshake_port,
+                    offset=0,
+                    tp_num_need_pulls=1,
+                    all_task_done=True,
+                )
+                continue
 
             if meta.remote_pcp_size * meta.remote_dcp_size > 1:
                 remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = self._get_kv_split_metadata(

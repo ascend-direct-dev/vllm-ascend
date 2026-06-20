@@ -36,6 +36,10 @@ patch(
 ).start()
 patch("vllm.distributed.parallel_state._DCP", _mock_dcp_group).start()
 
+from vllm.distributed.kv_transfer.kv_connector.v1.base import supports_hma  # noqa: E402
+from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec  # noqa: E402
+from vllm.v1.request import RequestStatus  # noqa: E402
+
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
     KVCacheRecvingThread,
     KVCacheSendingThread,
@@ -50,6 +54,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     ensure_zmq_recv,
     ensure_zmq_send,
     group_concurrent_contiguous,
+    has_any_block_id,
+    normalize_block_id_groups,
     string_to_int64_hash,
     zmq_ctx,
 )
@@ -1363,6 +1369,234 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
 
         tp_num_need_pulls = worker._get_tp_num_need_pulls(prefill_tp_size=None)
         self.assertEqual(tp_num_need_pulls, 1)
+
+
+class TestBlockIdGroupHelpers(unittest.TestCase):
+    def test_normalize_flat_list(self):
+        self.assertEqual(normalize_block_id_groups([1, 2, 3]), [[1, 2, 3]])
+
+    def test_normalize_grouped(self):
+        self.assertEqual(normalize_block_id_groups(([1, 2], [3])), [[1, 2], [3]])
+        self.assertEqual(normalize_block_id_groups([[1, 2], []]), [[1, 2], []])
+
+    def test_normalize_empty(self):
+        self.assertEqual(normalize_block_id_groups([]), [])
+        self.assertEqual(normalize_block_id_groups(None), [])
+
+    def test_has_any_block_id(self):
+        self.assertTrue(has_any_block_id([4, 5, 6]))
+        self.assertTrue(has_any_block_id([[], [7]]))
+        self.assertFalse(has_any_block_id([]))
+        self.assertFalse(has_any_block_id([[], []]))
+
+
+class TestMooncakeConnectorHMASupport(unittest.TestCase):
+    def test_connector_declares_hma_support(self):
+        self.assertTrue(supports_hma(MooncakeConnector))
+
+
+class TestMooncakeSchedulerHMA(unittest.TestCase):
+    def _make_scheduler(self, is_hma):
+        scheduler = object.__new__(MooncakeConnectorScheduler)
+        scheduler.is_hma = is_hma
+        scheduler.kv_cache_config = None
+        scheduler.block_size = 16
+        scheduler.engine_id = "engine"
+        scheduler.side_channel_host = "localhost"
+        scheduler.side_channel_port = 5000
+        scheduler.pcp_size = 1
+        scheduler.dcp_size = 1
+        scheduler.tp_size = 2
+        scheduler.multi_nodes_meta_mapping = {}
+        scheduler._reqs_need_recv = {}
+        scheduler._reqs_need_send = {}
+        scheduler._reqs_in_batch = set()
+        return scheduler
+
+    def test_request_finished_all_groups_delays_on_any_group_blocks(self):
+        scheduler = self._make_scheduler(is_hma=True)
+        request = MockRequest(
+            "req-hma",
+            kv_transfer_params={"do_remote_decode": True},
+            status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        )
+
+        delay, params = scheduler.request_finished_all_groups(request, ([], [7]))
+
+        self.assertTrue(delay)
+        self.assertIsNotNone(params)
+        # Under HMA remote_block_ids stay grouped (one list per KV cache group).
+        self.assertEqual(params["remote_block_ids"], [[], [7]])
+        self.assertIn("req-hma", scheduler._reqs_need_send)
+
+    def test_request_finished_all_groups_no_blocks(self):
+        scheduler = self._make_scheduler(is_hma=True)
+        request = MockRequest(
+            "req-empty",
+            kv_transfer_params={"do_remote_decode": True},
+            status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        )
+
+        delay, params = scheduler.request_finished_all_groups(request, ([], []))
+
+        self.assertFalse(delay)
+        self.assertEqual(params["remote_block_ids"], [[], []])
+        self.assertNotIn("req-empty", scheduler._reqs_need_send)
+
+    def test_request_finished_legacy_single_group_flat(self):
+        scheduler = self._make_scheduler(is_hma=False)
+        request = MockRequest(
+            "req-legacy",
+            kv_transfer_params={"do_remote_decode": True},
+            status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        )
+
+        delay, params = scheduler.request_finished(request, [1, 2])
+
+        self.assertTrue(delay)
+        # Non-HMA keeps the legacy flat remote_block_ids wire format.
+        self.assertEqual(params["remote_block_ids"], [1, 2])
+
+    def test_update_state_after_alloc_uses_group_accessor_under_hma(self):
+        scheduler = self._make_scheduler(is_hma=True)
+        request = MockRequest(
+            "req1",
+            kv_transfer_params={
+                "do_remote_prefill": True,
+                "remote_block_ids": [1, 2, 3],
+                "remote_engine_id": "remote",
+                "remote_host": "localhost",
+                "remote_port": 5000,
+                "remote_request_id": "rreq1",
+            },
+        )
+        blocks = MagicMock()
+        blocks.get_unhashed_block_ids_all_groups.return_value = [[1], [2]]
+
+        scheduler.update_state_after_alloc(request, blocks, num_external_tokens=16)
+
+        blocks.get_unhashed_block_ids_all_groups.assert_called_once()
+        blocks.get_unhashed_block_ids.assert_not_called()
+        self.assertEqual(scheduler._reqs_need_recv["req1"][1], [[1], [2]])
+
+    def test_scheduler_init_raises_for_hma_with_context_parallel(self):
+        config = MockVllmConfig()
+        config.parallel_config.prefill_context_parallel_size = 2
+        config.parallel_config.decode_context_parallel_size = 1
+        config.parallel_config.tensor_parallel_size = 2
+        config.parallel_config.data_parallel_size = 1
+        config.parallel_config.pipeline_parallel_size = 1
+        config.parallel_config.data_parallel_rank = 0
+        kv_cache_config = types.SimpleNamespace(kv_cache_groups=[object(), object()])
+        with (
+            patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.init_ascend_config"),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config",
+                return_value=MagicMock(),
+            ),
+        ):
+            with self.assertRaises(ValueError):
+                MooncakeConnectorScheduler(config, "engine", kv_cache_config)
+
+
+class TestMooncakeWorkerHMAGroups(unittest.TestCase):
+    def _bare_worker(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker.is_hma = True
+        worker.layer_to_group_id = {}
+        worker.group_types = ["attention"]
+        return worker
+
+    def test_init_kv_cache_groups_attention_and_gdn(self):
+        worker = self._bare_worker()
+        attn = MagicMock(spec=AttentionSpec)
+        gdn = MagicMock(spec=MambaSpec)
+        gdn.mamba_type = "gdn_attention"
+        worker.kv_cache_config = types.SimpleNamespace(
+            kv_cache_groups=[
+                types.SimpleNamespace(kv_cache_spec=attn, layer_names=["a0", "a1"]),
+                types.SimpleNamespace(kv_cache_spec=gdn, layer_names=["g0"]),
+            ]
+        )
+
+        worker._init_kv_cache_groups()
+
+        self.assertEqual(worker.group_types, ["attention", "gdn_attention"])
+        self.assertEqual(worker.layer_to_group_id, {"a0": 0, "a1": 0, "g0": 1})
+        self.assertTrue(worker._uses_hybrid_attn_and_gdn())
+        self.assertEqual(worker._get_layer_group_id("a1"), 0)
+        self.assertEqual(worker._get_layer_group_id("g0"), 1)
+
+    def test_init_kv_cache_groups_rejects_non_gdn_mamba(self):
+        worker = self._bare_worker()
+        bad = MagicMock(spec=MambaSpec)
+        bad.mamba_type = "mamba2"
+        worker.kv_cache_config = types.SimpleNamespace(
+            kv_cache_groups=[types.SimpleNamespace(kv_cache_spec=bad, layer_names=["m0"])]
+        )
+
+        with self.assertRaises(ValueError):
+            worker._init_kv_cache_groups()
+
+
+class TestKVCacheRecvingThreadHMATransfer(unittest.TestCase):
+    def _bare_recv_thread(self):
+        thread = object.__new__(KVCacheRecvingThread)
+        thread.is_hma = True
+        thread.tp_rank = 0
+        thread.local_engine_id = "local"
+        thread.local_handshake_port = 5555
+        # region metadata aligned with the flat kv cache base address list:
+        # 2 attention regions (group 0) + 2 gdn regions (group 1)
+        thread.region_group_ids = [0, 0, 1, 1]
+        thread.region_block_len = [10, 10, 50, 60]
+        thread.kv_caches_base_addr = {
+            "local": {5555: [1000, 2000, 3000, 4000]},
+            "remote": {6666: [1_000_000, 2_000_000, 3_000_000, 4_000_000]},
+        }
+        thread.remote_te_port = {"remote": {6666: 7000}}
+        thread.engine = MagicMock()
+        thread.engine.batch_transfer_sync_read = MagicMock(return_value=0)
+        return thread
+
+    def test_transfer_kv_cache_hma_per_group(self):
+        thread = self._bare_recv_thread()
+        req_meta = {
+            "remote_request_id": "rreq",
+            "remote_engine_id": "remote",
+            "remote_host": "localhost",
+            "remote_handshake_port": 6666,
+            # group 0 (attention): 2 blocks, group 1 (gdn): 1 state block
+            "local_block_ids": [[5, 6], [9]],
+            "remote_block_ids": [[1, 2], [3]],
+        }
+
+        thread._transfer_kv_cache_hma(req_meta)
+
+        thread.engine.batch_transfer_sync_read.assert_called_once()
+        session_id, src_list, dst_list, length_list = thread.engine.batch_transfer_sync_read.call_args.args
+        self.assertEqual(session_id, "localhost:7000")
+        self.assertEqual(src_list, [1000 + 5 * 10, 2000 + 5 * 10, 3000 + 9 * 50, 4000 + 9 * 60])
+        self.assertEqual(
+            dst_list,
+            [1_000_000 + 1 * 10, 2_000_000 + 1 * 10, 3_000_000 + 3 * 50, 4_000_000 + 3 * 60],
+        )
+        self.assertEqual(length_list, [10 * 2, 10 * 2, 50 * 1, 60 * 1])
+
+    def test_transfer_kv_cache_hma_full_prefix_hit_noop(self):
+        thread = self._bare_recv_thread()
+        req_meta = {
+            "remote_request_id": "rreq",
+            "remote_engine_id": "remote",
+            "remote_host": "localhost",
+            "remote_handshake_port": 6666,
+            "local_block_ids": [[], []],
+            "remote_block_ids": [[1, 2], [3]],
+        }
+
+        thread._transfer_kv_cache_hma(req_meta)
+
+        thread.engine.batch_transfer_sync_read.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_b
     MooncakeStoreConfig,
     _convert_to_bytes,
     _parse_global_segment_size,
+    _skip_global_te_buffer_registration,
+    _use_fabric_mem_setup,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend import (
     YuanrongConfig,
@@ -155,6 +157,36 @@ class TestConvertToBytes(unittest.TestCase):
     def test_invalid_number(self):
         with self.assertRaises(ValueError):
             _convert_to_bytes("abc", 1, "abc")
+
+
+class TestMooncakeBackendEnvHelpers(unittest.TestCase):
+    def test_use_fabric_mem_setup_fabric_mem(self):
+        with patch.dict(os.environ, {"ASCEND_ENABLE_USE_FABRIC_MEM": "1"}, clear=False):
+            self.assertTrue(_use_fabric_mem_setup())
+
+    def test_use_fabric_mem_setup_global_resource_config(self):
+        with patch.dict(
+            os.environ,
+            {"ASCEND_ENABLE_USE_FABRIC_MEM": "0", "ASCEND_GLOBAL_RESOURCE_CONFIG": "/path/to/config"},
+            clear=False,
+        ):
+            self.assertTrue(_use_fabric_mem_setup())
+
+    def test_use_fabric_mem_setup_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(_use_fabric_mem_setup())
+
+    def test_skip_global_te_buffer_registration_fabric_mem_only(self):
+        with patch.dict(os.environ, {"ASCEND_ENABLE_USE_FABRIC_MEM": "1"}, clear=False):
+            self.assertTrue(_skip_global_te_buffer_registration())
+
+    def test_skip_global_te_buffer_registration_global_resource_config(self):
+        with patch.dict(
+            os.environ,
+            {"ASCEND_ENABLE_USE_FABRIC_MEM": "0", "ASCEND_GLOBAL_RESOURCE_CONFIG": "/path/to/config"},
+            clear=False,
+        ):
+            self.assertFalse(_skip_global_te_buffer_registration())
 
 
 # =========================================================================
@@ -298,15 +330,37 @@ class TestMooncakeBackendMethods(unittest.TestCase):
 
     def test_register_buffer(self):
         b = self._make_backend()
-        with (
-            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.os") as mock_os,
-            patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te"
-            ) as mock_te,
-        ):
-            mock_os.getenv.return_value = "0"
-            b.register_buffer([100], [200])
-            mock_te.register_buffer.assert_called_once()
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te"
+        ) as mock_te:
+            with patch.dict(os.environ, {"ASCEND_ENABLE_USE_FABRIC_MEM": "0"}, clear=False):
+                b.register_buffer([100], [200])
+                mock_te.register_buffer.assert_called_once_with([100], [200])
+
+    def test_register_buffer_skips_for_fabric_mem(self):
+        b = self._make_backend()
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te"
+        ) as mock_te:
+            with patch.dict(os.environ, {"ASCEND_ENABLE_USE_FABRIC_MEM": "1"}, clear=False):
+                b.register_buffer([100], [200])
+                mock_te.register_buffer.assert_not_called()
+
+    def test_register_buffer_global_resource_config_still_registers(self):
+        b = self._make_backend()
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te"
+        ) as mock_te:
+            with patch.dict(
+                os.environ,
+                {
+                    "ASCEND_ENABLE_USE_FABRIC_MEM": "0",
+                    "ASCEND_GLOBAL_RESOURCE_CONFIG": "/path/to/config",
+                },
+                clear=False,
+            ):
+                b.register_buffer([100], [200])
+                mock_te.register_buffer.assert_called_once_with([100], [200])
 
 
 # =========================================================================

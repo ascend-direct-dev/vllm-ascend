@@ -19,6 +19,23 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
 
+def _use_fabric_mem_setup() -> bool:
+    """Use the fabric-mem store.setup path (no global TE in setup).
+
+    Triggered by ASCEND_ENABLE_USE_FABRIC_MEM or ASCEND_GLOBAL_RESOURCE_CONFIG
+    (e.g. dual-protocol Store/P2P split with RoCE for Store).
+    """
+    if os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") == "1":
+        return True
+    return bool(os.getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
+
+
+def _skip_global_te_buffer_registration() -> bool:
+    # ASCEND_GLOBAL_RESOURCE_CONFIG reuses fabric-mem setup but still registers
+    # local buffers via global TE; only fabric_mem skips registration.
+    return os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") == "1"
+
+
 class MooncakeBackend(Backend):
     def __init__(self, parallel_config: ParallelConfig):
         try:
@@ -36,7 +53,9 @@ class MooncakeBackend(Backend):
             # ASCEND_ENABLE_USE_FABRIC_MEM: Enable unified memory address direct transmission scheme
             # and only can be used for 800 I/T A3 series.
             # Required supporting hardware versions are as follows:
-            if os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") != "1":
+            # ASCEND_GLOBAL_RESOURCE_CONFIG: dual-protocol / RoCE Store path; same setup as
+            # fabric_mem (no global TE in setup) but local buffer registration unchanged.
+            if not _use_fabric_mem_setup():
                 transfer_engine = global_te.get_transfer_engine(local_hostname, device_name=None)
                 self.local_seg = local_hostname + ":" + str(transfer_engine.get_rpc_port())
                 ret = self.store.setup(
@@ -74,7 +93,7 @@ class MooncakeBackend(Backend):
         torch.npu.set_device(device)
 
     def register_buffer(self, ptrs: list[int], lengths: list[int]):
-        if os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") != "1":
+        if not _skip_global_te_buffer_registration():
             global_te.register_buffer(ptrs, lengths)
 
     def exists(self, keys: list[str]) -> list[int]:

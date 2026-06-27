@@ -94,6 +94,15 @@ def has_any_block_id(block_ids: "tuple[list[int], ...] | list[list[int]] | list[
     return any(group for group in normalize_block_id_groups(block_ids))
 
 
+# vLLM GDN / linear-attention hybrid models expose MambaSpec with
+# mamba_type='linear_attention' (see check_gdn_layer in vllm_ascend.utils).
+GDN_MAMBA_TYPES = frozenset({"gdn_attention", "linear_attention"})
+
+
+def is_gdn_mamba_type(mamba_type: str) -> bool:
+    return mamba_type in GDN_MAMBA_TYPES
+
+
 class RemotePortInfo(TypedDict):
     num: int
     host: str
@@ -1405,10 +1414,11 @@ class MooncakeConnectorWorker:
                 kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
 
             if isinstance(kv_cache_spec, MambaSpec):
-                if kv_cache_spec.mamba_type != "gdn_attention":
+                if not is_gdn_mamba_type(kv_cache_spec.mamba_type):
                     if self.is_hma:
                         raise ValueError(
-                            "MooncakeConnector HMA only supports MambaSpec(mamba_type='gdn_attention')."
+                            "MooncakeConnector HMA only supports MambaSpec(mamba_type="
+                            "'gdn_attention' or 'linear_attention')."
                         )
                     group_type = kv_cache_spec.mamba_type
                 else:

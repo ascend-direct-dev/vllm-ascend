@@ -25,6 +25,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     KeyMetadata,
     LayerMultiBlockReqMeta,
     ReqMeta,
+    is_gdn_mamba_type,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreLayerRecvingThread,
@@ -184,10 +185,11 @@ class KVPoolWorker:
                 kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
 
             if isinstance(kv_cache_spec, MambaSpec):
-                if kv_cache_spec.mamba_type != "gdn_attention":
+                if not is_gdn_mamba_type(kv_cache_spec.mamba_type):
                     if self.is_hma:
                         raise ValueError(
-                            "AscendStoreConnector HMA only supports MambaSpec(mamba_type='gdn_attention')."
+                            "AscendStoreConnector HMA only supports MambaSpec(mamba_type="
+                            "'gdn_attention' or 'linear_attention')."
                         )
                     group_type = kv_cache_spec.mamba_type
                 else:

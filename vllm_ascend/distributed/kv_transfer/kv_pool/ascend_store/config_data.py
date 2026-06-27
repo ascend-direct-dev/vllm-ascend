@@ -30,6 +30,15 @@ def has_any_block_id(block_ids: tuple[list[int], ...] | list[list[int]] | list[i
     return any(group for group in normalize_block_id_groups(block_ids))
 
 
+# vLLM GDN / linear-attention hybrid models expose MambaSpec with
+# mamba_type='linear_attention' (see check_gdn_layer in vllm_ascend.utils).
+GDN_MAMBA_TYPES = frozenset({"gdn_attention", "linear_attention"})
+
+
+def is_gdn_mamba_type(mamba_type: str) -> bool:
+    return mamba_type in GDN_MAMBA_TYPES
+
+
 @dataclass(frozen=True)
 class CacheRegion:
     group_id: int

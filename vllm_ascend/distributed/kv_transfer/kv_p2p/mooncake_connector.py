@@ -94,13 +94,24 @@ def has_any_block_id(block_ids: "tuple[list[int], ...] | list[list[int]] | list[
     return any(group for group in normalize_block_id_groups(block_ids))
 
 
-# vLLM GDN / linear-attention hybrid models expose MambaSpec with
-# mamba_type='linear_attention' (see check_gdn_layer in vllm_ascend.utils).
-GDN_MAMBA_TYPES = frozenset({"gdn_attention", "linear_attention"})
+# vLLM <=0.19: str 'gdn_attention' (GatedDeltaNet) or 'linear_attention' (LinearAttn).
+# vLLM >=0.21: MambaAttentionBackendEnum.GDN_ATTN / .LINEAR (see gdn_linear_attn.py).
+GDN_MAMBA_STRING_TYPES = frozenset({"gdn_attention", "linear_attention"})
+GDN_MAMBA_ENUM_NAMES = frozenset({"GDN_ATTN", "LINEAR"})
 
 
-def is_gdn_mamba_type(mamba_type: str) -> bool:
-    return mamba_type in GDN_MAMBA_TYPES
+def is_gdn_mamba_type(mamba_type) -> bool:
+    if isinstance(mamba_type, str):
+        return mamba_type in GDN_MAMBA_STRING_TYPES
+    enum_name = getattr(mamba_type, "name", None)
+    if enum_name in GDN_MAMBA_ENUM_NAMES:
+        return True
+    enum_value = getattr(mamba_type, "value", None)
+    if isinstance(enum_value, str):
+        lower = enum_value.lower()
+        if "gdn_attn" in lower or "linear_attn" in lower:
+            return True
+    return False
 
 
 class RemotePortInfo(TypedDict):
@@ -1418,7 +1429,7 @@ class MooncakeConnectorWorker:
                     if self.is_hma:
                         raise ValueError(
                             "MooncakeConnector HMA only supports MambaSpec(mamba_type="
-                            "'gdn_attention' or 'linear_attention')."
+                            "'gdn_attention', 'linear_attention', or vLLM>=0.21 GDN_ATTN/LINEAR enum)."
                         )
                     group_type = kv_cache_spec.mamba_type
                 else:

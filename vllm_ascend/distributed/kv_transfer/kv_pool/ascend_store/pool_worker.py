@@ -189,7 +189,7 @@ class KVPoolWorker:
                     if self.is_hma:
                         raise ValueError(
                             "AscendStoreConnector HMA only supports MambaSpec(mamba_type="
-                            "'gdn_attention' or 'linear_attention')."
+                            "'gdn_attention', 'linear_attention', or vLLM>=0.21 GDN_ATTN/LINEAR enum)."
                         )
                     group_type = kv_cache_spec.mamba_type
                 else:

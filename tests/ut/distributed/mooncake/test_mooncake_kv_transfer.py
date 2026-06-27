@@ -15,6 +15,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     LayerMultiBlockReqMeta,
     ReqMeta,
     TransferItem,
+    is_gdn_mamba_type,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreLayerSendingThread,
@@ -135,6 +136,25 @@ class TestKVTransferMissingKeyPut(unittest.TestCase):
         self.assertEqual(put_keys, ["k1", "k3"])
         self.assertEqual(put_addrs, [[2101], [2103]])
         self.assertEqual(put_sizes, [[16], [16]])
+
+
+class TestIsGdnMambaType(unittest.TestCase):
+    def test_accepts_legacy_strings(self):
+        self.assertTrue(is_gdn_mamba_type("gdn_attention"))
+        self.assertTrue(is_gdn_mamba_type("linear_attention"))
+        self.assertFalse(is_gdn_mamba_type("mamba2"))
+
+    def test_accepts_v021_enum(self):
+        gdn_enum = SimpleNamespace(
+            name="GDN_ATTN",
+            value="vllm.v1.attention.backends.gdn_attn.GDNAttentionBackend",
+        )
+        linear_enum = SimpleNamespace(
+            name="LINEAR",
+            value="vllm.v1.attention.backends.linear_attn.LinearAttentionBackend",
+        )
+        self.assertTrue(is_gdn_mamba_type(gdn_enum))
+        self.assertTrue(is_gdn_mamba_type(linear_enum))
 
 
 class TestChunkedTokenDatabaseHMA(unittest.TestCase):

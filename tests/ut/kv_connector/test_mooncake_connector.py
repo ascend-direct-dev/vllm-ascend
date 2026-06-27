@@ -1544,6 +1544,26 @@ class TestMooncakeWorkerHMAGroups(unittest.TestCase):
         self.assertEqual(worker.group_types, ["attention", "gdn_attention"])
         self.assertEqual(worker._get_layer_group_id("g0"), 1)
 
+    def test_init_kv_cache_groups_accepts_v021_gdn_attn_enum(self):
+        worker = self._bare_worker()
+        attn = MagicMock(spec=AttentionSpec)
+        gdn = MagicMock(spec=MambaSpec)
+        gdn_enum = types.SimpleNamespace(
+            name="GDN_ATTN",
+            value="vllm.v1.attention.backends.gdn_attn.GDNAttentionBackend",
+        )
+        gdn.mamba_type = gdn_enum
+        worker.kv_cache_config = types.SimpleNamespace(
+            kv_cache_groups=[
+                types.SimpleNamespace(kv_cache_spec=attn, layer_names=["a0"]),
+                types.SimpleNamespace(kv_cache_spec=gdn, layer_names=["g0"]),
+            ]
+        )
+
+        worker._init_kv_cache_groups()
+
+        self.assertEqual(worker.group_types, ["attention", "gdn_attention"])
+
     def test_init_kv_cache_groups_rejects_non_gdn_mamba(self):
         worker = self._bare_worker()
         bad = MagicMock(spec=MambaSpec)

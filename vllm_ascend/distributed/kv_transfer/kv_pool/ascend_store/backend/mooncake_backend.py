@@ -30,9 +30,13 @@ def _use_fabric_mem_setup() -> bool:
     return bool(os.getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
 
 
+def _use_store_buffer_registration() -> bool:
+    """Register local buffers via Mooncake store (RoCE Store path)."""
+    return bool(os.getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
+
+
 def _skip_global_te_buffer_registration() -> bool:
-    # ASCEND_GLOBAL_RESOURCE_CONFIG reuses fabric-mem setup but still registers
-    # local buffers via global TE; only fabric_mem skips registration.
+    # fabric_mem skips buffer registration; ASCEND_GLOBAL_RESOURCE_CONFIG uses store.
     return os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") == "1"
 
 
@@ -54,7 +58,7 @@ class MooncakeBackend(Backend):
             # and only can be used for 800 I/T A3 series.
             # Required supporting hardware versions are as follows:
             # ASCEND_GLOBAL_RESOURCE_CONFIG: dual-protocol / RoCE Store path; same setup as
-            # fabric_mem (no global TE in setup) but local buffer registration unchanged.
+            # fabric_mem (no global TE in setup); local buffers registered via store.
             if not _use_fabric_mem_setup():
                 transfer_engine = global_te.get_transfer_engine(local_hostname, device_name=None)
                 self.local_seg = local_hostname + ":" + str(transfer_engine.get_rpc_port())
@@ -70,6 +74,17 @@ class MooncakeBackend(Backend):
                 )
             else:
                 self.local_seg = local_hostname
+                if _use_store_buffer_registration():
+                    logger.info(
+                        "Mooncake setup with ASCEND_GLOBAL_RESOURCE_CONFIG: "
+                        "local_seg=%s, local buffers will be registered via store",
+                        self.local_seg,
+                    )
+                else:
+                    logger.info(
+                        "Mooncake setup with ASCEND_ENABLE_USE_FABRIC_MEM: local_seg=%s",
+                        self.local_seg,
+                    )
                 ret = self.store.setup(
                     self.local_seg,
                     self.config.metadata_server,
@@ -93,7 +108,21 @@ class MooncakeBackend(Backend):
         torch.npu.set_device(device)
 
     def register_buffer(self, ptrs: list[int], lengths: list[int]):
-        if not _skip_global_te_buffer_registration():
+        if _use_store_buffer_registration():
+            logger.info(
+                "Registering %d buffer(s) via Mooncake store (ASCEND_GLOBAL_RESOURCE_CONFIG)",
+                len(ptrs),
+            )
+            for ptr, length in zip(ptrs, lengths):
+                ret = self.store.register_buffer(ptr, length)
+                if ret != 0:
+                    logger.error(
+                        "Failed to register buffer via store: ptr=%s, length=%s, ret=%s",
+                        ptr,
+                        length,
+                        ret,
+                    )
+        elif not _skip_global_te_buffer_registration():
             global_te.register_buffer(ptrs, lengths)
 
     def exists(self, keys: list[str]) -> list[int]:

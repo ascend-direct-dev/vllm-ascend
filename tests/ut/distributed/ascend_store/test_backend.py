@@ -29,6 +29,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_b
     _parse_global_segment_size,
     _skip_global_te_buffer_registration,
     _use_fabric_mem_setup,
+    _use_store_buffer_registration,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend import (
     YuanrongConfig,
@@ -188,6 +189,18 @@ class TestMooncakeBackendEnvHelpers(unittest.TestCase):
         ):
             self.assertFalse(_skip_global_te_buffer_registration())
 
+    def test_use_store_buffer_registration_global_resource_config(self):
+        with patch.dict(
+            os.environ,
+            {"ASCEND_ENABLE_USE_FABRIC_MEM": "0", "ASCEND_GLOBAL_RESOURCE_CONFIG": "/path/to/config"},
+            clear=False,
+        ):
+            self.assertTrue(_use_store_buffer_registration())
+
+    def test_use_store_buffer_registration_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(_use_store_buffer_registration())
+
 
 # =========================================================================
 # YuanrongConfig
@@ -346,8 +359,9 @@ class TestMooncakeBackendMethods(unittest.TestCase):
                 b.register_buffer([100], [200])
                 mock_te.register_buffer.assert_not_called()
 
-    def test_register_buffer_global_resource_config_still_registers(self):
+    def test_register_buffer_global_resource_config_uses_store(self):
         b = self._make_backend()
+        b.store.register_buffer.return_value = 0
         with patch(
             "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.global_te"
         ) as mock_te:
@@ -360,7 +374,8 @@ class TestMooncakeBackendMethods(unittest.TestCase):
                 clear=False,
             ):
                 b.register_buffer([100], [200])
-                mock_te.register_buffer.assert_called_once_with([100], [200])
+                b.store.register_buffer.assert_called_once_with(100, 200)
+                mock_te.register_buffer.assert_not_called()
 
 
 # =========================================================================

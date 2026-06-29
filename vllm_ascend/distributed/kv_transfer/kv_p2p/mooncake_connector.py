@@ -1122,6 +1122,56 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_scheduler.set_xfer_handshake_metadata(metadata)
 
 
+_kv_transfer_alloc_diag_patched = False
+
+
+def _patch_kv_cache_manager_allocate_slots_for_diag() -> None:
+    """Monkey-patch KVCacheManager.allocate_slots to log why a PD decode
+    request cannot be scheduled (returns None). Independent of which
+    scheduler implementation is in use (upstream Scheduler,
+    RecomputeScheduler, SchedulerDynamicBatch, ...).
+    """
+    global _kv_transfer_alloc_diag_patched
+    if _kv_transfer_alloc_diag_patched:
+        return
+    _kv_transfer_alloc_diag_patched = True
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    _orig_allocate_slots = KVCacheManager.allocate_slots
+
+    def _allocate_slots_with_diag(self, request, num_new_tokens, *args, **kwargs):
+        result = _orig_allocate_slots(self, request, num_new_tokens, *args, **kwargs)
+        if result is None:
+            num_ext = kwargs.get("num_external_computed_tokens", 0)
+            delay = kwargs.get("delay_cache_blocks", False)
+            if num_ext > 0 or delay:
+                try:
+                    logger.info(
+                        "KVCacheManager.allocate_slots returned None (PD KV transfer): "
+                        "request=%s, num_new_tokens=%d, num_external_computed_tokens=%d, "
+                        "delay_cache_blocks=%s, free_blocks=%d, num_gpu_blocks=%d",
+                        request.request_id,
+                        num_new_tokens,
+                        num_ext,
+                        delay,
+                        self.block_pool.get_num_free_blocks(),
+                        self.block_pool.num_gpu_blocks,
+                    )
+                except Exception as e:
+                    logger.info(
+                        "KVCacheManager.allocate_slots returned None (PD KV transfer): "
+                        "request=%s, num_new_tokens=%d, num_external_computed_tokens=%d "
+                        "(diag failed: %s)",
+                        request.request_id,
+                        num_new_tokens,
+                        num_ext,
+                        e,
+                    )
+        return result
+
+    KVCacheManager.allocate_slots = _allocate_slots_with_diag
+
+
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
@@ -1133,6 +1183,7 @@ class MooncakeConnectorScheduler:
         self.engine_id = engine_id
         self.local_ip = get_ip()
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
+        _patch_kv_cache_manager_allocate_slots_for_diag()
 
         self.side_channel_host = get_ip()
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size

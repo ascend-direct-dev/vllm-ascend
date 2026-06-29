@@ -1215,10 +1215,17 @@ class MooncakeConnectorScheduler:
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         params = request.kv_transfer_params
-        logger.debug(
-            "MooncakeConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
+        remote_block_ids = params.get("remote_block_ids") if params is not None else None
+        logger.info(
+            "MooncakeConnector update_state_after_alloc: request=%s, num_external_tokens=%d, "
+            "do_remote_prefill=%s, has_remote_block_ids=%s, remote_block_ids_len=%s, is_hma=%s",
+            request.request_id,
             num_external_tokens,
-            params,
+            params.get("do_remote_prefill") if params is not None else None,
+            remote_block_ids is not None and bool(remote_block_ids),
+            sum(len(g) for g in remote_block_ids) if self.is_hma and remote_block_ids
+            else (len(remote_block_ids) if remote_block_ids is not None else 0),
+            self.is_hma,
         )
 
         if params is not None and (params.get("do_remote_prefill", False) or params.get("do_remote_decode", False)):

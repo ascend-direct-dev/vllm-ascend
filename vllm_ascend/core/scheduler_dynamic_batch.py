@@ -451,6 +451,30 @@ class SchedulerDynamicBatch(Scheduler):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    try:
+                        _bp = self.kv_cache_manager.coordinator.block_pool
+                        logger.info(
+                            "SchedulerDynamicBatch allocate_slots returned None: request=%s, "
+                            "num_new_tokens=%d, num_external_computed_tokens=%d, "
+                            "num_new_local_computed_tokens=%d, load_kv_async=%s, "
+                            "free_blocks=%d, num_gpu_blocks=%d",
+                            request.request_id,
+                            num_new_tokens,
+                            num_external_computed_tokens,
+                            num_new_local_computed_tokens,
+                            load_kv_async,
+                            _bp.get_num_free_blocks(),
+                            _bp.num_gpu_blocks,
+                        )
+                    except Exception as e:
+                        logger.info(
+                            "SchedulerDynamicBatch allocate_slots returned None: request=%s, "
+                            "num_new_tokens=%d, num_external_computed_tokens=%d (block_pool diag failed: %s)",
+                            request.request_id,
+                            num_new_tokens,
+                            num_external_computed_tokens,
+                            e,
+                        )
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -472,6 +496,11 @@ class SchedulerDynamicBatch(Scheduler):
                     # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    # Set num_computed_tokens even though KVs are not yet loaded,
+                    # mirroring upstream Scheduler / RecomputeScheduler so that
+                    # the request is not re-scheduled for remote prefill while
+                    # waiting for the async KV transfer to finish.
+                    request.num_computed_tokens = num_computed_tokens
                     continue
 
                 req_index += 1

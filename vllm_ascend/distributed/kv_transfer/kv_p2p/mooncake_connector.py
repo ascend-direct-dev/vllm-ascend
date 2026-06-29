@@ -1123,6 +1123,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
 
 _kv_transfer_alloc_diag_patched = False
+_mamba_block_aligned_split_patched = False
 
 
 def _patch_kv_cache_manager_allocate_slots_for_diag() -> None:
@@ -1176,6 +1177,74 @@ def _patch_kv_cache_manager_allocate_slots_for_diag() -> None:
     )
 
 
+def _patch_scheduler_mamba_block_aligned_split_for_pd_kv() -> None:
+    """Monkey-patch Scheduler._mamba_block_aligned_split so PD disaggregation
+    works for hybrid (mamba + attention) models on vLLM 0.21.0.
+
+    vLLM 0.21.0's ``_mamba_block_aligned_split`` hard-asserts
+    ``num_external_computed_tokens == 0`` ("External KV connector is not
+    verified yet"). On the D node of a PD disaggregation, the scheduler calls
+    it with ``num_external_computed_tokens`` = number of remote prefill tokens
+    (e.g. 3602) and ``num_new_tokens == 0`` (load_kv_async), so:
+
+      1. the assert crashes the scheduler before ``allocate_slots`` /
+         ``update_state_after_alloc`` are reached (=> no pull requests,
+         do_remote_prefill never cleared => infinite decode-schedule loop);
+      2. even if the assert were removed, the caller breaks out of the
+         scheduling loop when ``num_new_tokens == 0`` is returned.
+
+    For a PD KV transfer step we do not need mamba block-aligned splitting at
+    all (the D node only pulls remote KV, it does not prefill). Skip the split
+    in that case and return a positive value so the scheduler proceeds to
+    ``allocate_slots`` / ``update_state_after_alloc``.
+    """
+    global _mamba_block_aligned_split_patched
+    if _mamba_block_aligned_split_patched:
+        return
+    _mamba_block_aligned_split_patched = True
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    _orig_split = Scheduler._mamba_block_aligned_split
+
+    def _split_with_pd_kv(
+        self,
+        request: "Request",
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        if num_external_computed_tokens > 0:
+            logger.info(
+                "MooncakeConnector skip _mamba_block_aligned_split for PD KV transfer: "
+                "request=%s, num_new_tokens=%d, num_new_local_computed_tokens=%d, "
+                "num_external_computed_tokens=%d",
+                request.request_id,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+            # Return a positive value so the scheduler's
+            # `if num_new_tokens == 0: break` does not skip allocate_slots.
+            # allocate_slots uses cdiv() so 1 extra token does not allocate an
+            # extra block for the existing computed/external range, and
+            # delay_cache_blocks=True (load_kv_async) skips caching, so this is
+            # safe for the PD pull step.
+            return max(num_new_tokens, 1)
+        return _orig_split(
+            self,
+            request,
+            num_new_tokens,
+            num_new_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+
+    Scheduler._mamba_block_aligned_split = _split_with_pd_kv
+    logger.info(
+        "Scheduler._mamba_block_aligned_split PD-KV-transfer patch applied "
+        "(skips assert/split when num_external_computed_tokens > 0)"
+    )
+
+
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
@@ -1188,6 +1257,7 @@ class MooncakeConnectorScheduler:
         self.local_ip = get_ip()
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
         _patch_kv_cache_manager_allocate_slots_for_diag()
+        _patch_scheduler_mamba_block_aligned_split_for_pd_kv()
 
         self.side_channel_host = get_ip()
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size

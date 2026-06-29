@@ -361,7 +361,7 @@ class KVPoolWorker:
         self.layerwise_retrievers = []
         load_requests = [r for r in metadata.requests if r.load_spec is not None and r.load_spec.can_load]
         if not load_requests:
-            logger.info(
+            logger.debug(
                 "AscendStore decode start_load_kv: no loadable requests, tp_rank=%s, "
                 "total_requests=%d",
                 self.tp_rank,

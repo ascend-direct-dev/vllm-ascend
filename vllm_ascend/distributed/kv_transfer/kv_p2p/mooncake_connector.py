@@ -1987,7 +1987,7 @@ class MooncakeConnectorWorker:
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
         if not metadata.requests:
-            logger.info(
+            logger.debug(
                 "MooncakeConnector decode start_load_kv: no pull requests in metadata, tp_rank=%s",
                 self.tp_rank,
             )

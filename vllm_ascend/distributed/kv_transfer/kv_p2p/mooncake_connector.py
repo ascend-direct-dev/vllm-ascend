@@ -499,7 +499,15 @@ class KVCacheRecvingThread(threading.Thread):
         all_task_done = req_meta["all_task_done"]
 
         try:
-            logger.debug("Starting to transfer KV cache for request %s.", remote_request_id)
+            logger.info(
+                "MooncakeConnector decode pull start: request=%s, remote_request=%s, "
+                "remote_host=%s, remote_handshake_port=%s, tp_rank=%s",
+                request_id,
+                remote_request_id,
+                remote_host,
+                remote_handshake_port,
+                self.tp_rank,
+            )
             self._transfer_kv_cache(req_meta)
             logger.debug("Finished transferring KV cache for request %s.", remote_request_id)
         except Exception as e:
@@ -550,6 +558,12 @@ class KVCacheRecvingThread(threading.Thread):
         # P worker that we have the blocks we need.
         num_local_blocks = len(local_block_ids)
         if num_local_blocks == 0:
+            logger.info(
+                "MooncakeConnector decode pull skip: remote_request=%s, prefix cache hit "
+                "(no local blocks to pull), tp_rank=%s",
+                remote_request_id,
+                self.tp_rank,
+            )
             return
 
         num_remote_blocks = len(remote_block_ids)
@@ -612,6 +626,18 @@ class KVCacheRecvingThread(threading.Thread):
                 dst_list.append(dst)
                 length_list.append(length)
 
+        total_bytes = sum(length_list)
+        logger.info(
+            "MooncakeConnector decode batch_transfer_sync_read: remote_request=%s, "
+            "blocks=%d, groups=%d, bytes=%d, session=%s, tp_rank=%s, pp_rank=%s",
+            remote_request_id,
+            num_blocks,
+            num_transfer_groups,
+            total_bytes,
+            session_id,
+            self.tp_rank,
+            prefill_pp_rank,
+        )
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
@@ -732,6 +758,17 @@ class KVCacheRecvingThread(threading.Thread):
         if not src_list:
             return
 
+        total_bytes = sum(length_list)
+        logger.info(
+            "MooncakeConnector decode HMA batch_transfer_sync_read: remote_request=%s, "
+            "blocks=%d, groups=%d, bytes=%d, session=%s, tp_rank=%s",
+            remote_request_id,
+            total_blocks,
+            num_groups,
+            total_bytes,
+            session_id,
+            self.tp_rank,
+        )
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error("Mooncake transfer failed for request %s", remote_request_id)
@@ -1161,6 +1198,16 @@ class MooncakeConnectorScheduler:
             assert num_computed_tokens % self.block_size == 0
             # Note: We use the full token count as transmit data here.
             count = max(len(request.prompt_token_ids) - num_computed_tokens, 0)
+            if count > 0:
+                logger.info(
+                    "MooncakeConnector decode schedule: request=%s, external_tokens=%d, "
+                    "num_computed_tokens=%d, remote_engine_id=%s, remote_request_id=%s",
+                    request.request_id,
+                    count,
+                    num_computed_tokens,
+                    params.get("remote_engine_id"),
+                    params.get("remote_request_id"),
+                )
             return count, count > 0
 
         # No remote prefill for this request.
@@ -1191,6 +1238,16 @@ class MooncakeConnectorScheduler:
                     else:
                         local_block_ids = []
                     self._reqs_need_recv[request.request_id] = (request, local_block_ids, num_external_tokens)
+                    logger.info(
+                        "MooncakeConnector decode alloc: request=%s, num_external_tokens=%d, "
+                        "local_blocks=%d, remote_blocks=%d, remote_host=%s, remote_port=%s",
+                        request.request_id,
+                        num_external_tokens,
+                        sum(len(g) for g in local_block_ids) if self.is_hma else len(local_block_ids),
+                        len(params.get("remote_block_ids", [])),
+                        params.get("remote_host"),
+                        params.get("remote_port"),
+                    )
                 else:
                     logger.warning("Got invalid KVTransferParams: %s. This request will not utilize KVTransfer", params)
             else:
@@ -1210,6 +1267,14 @@ class MooncakeConnectorScheduler:
             # For the case where there are no remote blocks to pull
             # (block_ids is empty), we don't need to schedule
             # an async read on the worker side.
+            logger.info(
+                "MooncakeConnector decode build_meta: request=%s, num_external_tokens=%d, "
+                "local_blocks=%d, remote_blocks=%d",
+                req_id,
+                num_external_tokens,
+                sum(len(g) for g in block_ids) if self.is_hma else len(block_ids),
+                len(req.kv_transfer_params.get("remote_block_ids", [])),
+            )
             meta.add_new_req(
                 request_id=req_id,
                 local_block_ids=block_ids,
@@ -1863,16 +1928,32 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
+        if not metadata.requests:
+            logger.info(
+                "MooncakeConnector decode start_load_kv: no pull requests in metadata, tp_rank=%s",
+                self.tp_rank,
+            )
+        else:
+            logger.info(
+                "MooncakeConnector decode start_load_kv: %d request(s), tp_rank=%s, req_ids=%s",
+                len(metadata.requests),
+                self.tp_rank,
+                list(metadata.requests.keys()),
+            )
         for req_id, meta in metadata.requests.items():
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "start_load_kv for request %s from remote engine %s. "
-                    "Num local_block_ids: %s. Num remote_block_ids: %s. ",
-                    req_id,
-                    meta.remote_engine_id,
-                    len(meta.local_block_ids),
-                    len(meta.remote_block_ids),
-                )
+            logger.info(
+                "MooncakeConnector decode start_load_kv: request=%s, remote_request=%s, "
+                "remote_engine=%s, remote_host=%s, remote_port=%s, "
+                "local_blocks=%s, remote_blocks=%s, external_tokens=%s",
+                req_id,
+                meta.remote_request_id,
+                meta.remote_engine_id,
+                meta.remote_host,
+                meta.remote_port,
+                meta.local_block_ids,
+                meta.remote_block_ids,
+                meta.num_external_tokens,
+            )
 
             prefill_tp_size = meta.remote_ptp_size if getattr(meta, "remote_ptp_size", None) else self._prefill_tp_size
             tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)

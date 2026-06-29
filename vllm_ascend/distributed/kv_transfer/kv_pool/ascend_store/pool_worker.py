@@ -359,10 +359,34 @@ class KVPoolWorker:
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers = []
+        load_requests = [r for r in metadata.requests if r.load_spec is not None and r.load_spec.can_load]
+        if not load_requests:
+            logger.info(
+                "AscendStore decode start_load_kv: no loadable requests, tp_rank=%s, "
+                "total_requests=%d",
+                self.tp_rank,
+                len(metadata.requests),
+            )
+        else:
+            logger.info(
+                "AscendStore decode start_load_kv: %d loadable request(s), tp_rank=%s, "
+                "req_ids=%s",
+                len(load_requests),
+                self.tp_rank,
+                [r.req_id for r in load_requests],
+            )
         for request in metadata.requests:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:  # load =0
                 continue
+            logger.info(
+                "AscendStore decode start_load_kv: request=%s, kvpool_tokens=%d, "
+                "vllm_cached_tokens=%d, token_len_chunk=%d",
+                request.req_id,
+                load_spec.kvpool_cached_tokens,
+                load_spec.vllm_cached_tokens,
+                request.token_len_chunk,
+            )
             token_len = request.token_len_chunk
             if (load_spec.kvpool_cached_tokens % self.block_size != 0) and (
                 load_spec.kvpool_cached_tokens == token_len - 1

@@ -1,6 +1,7 @@
 # Standard
 import json
 import os
+import time
 from dataclasses import dataclass
 
 import regex as re
@@ -129,22 +130,56 @@ class MooncakeBackend(Backend):
         return self.store.batch_is_exist(keys)
 
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+        total_bytes = sum(sum(batch_sizes) for batch_sizes in sizes)
+        start = time.perf_counter()
         try:
             res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "AscendStore batch_put: keys=%d, bytes=%d, elapsed=%.2f ms, res=%s",
+                len(keys),
+                total_bytes,
+                elapsed_ms,
+                res,
+            )
             for value in res:
                 if value < 0:
                     logger.error("Failed to put key %s,res:%s", keys, res)
         except Exception as e:
-            logger.error("Failed to put key %s,error:%s", keys, e)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.error(
+                "AscendStore batch_put failed: keys=%d, bytes=%d, elapsed=%.2f ms, error=%s",
+                len(keys),
+                total_bytes,
+                elapsed_ms,
+                e,
+            )
 
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+        total_bytes = sum(sum(batch_sizes) for batch_sizes in sizes)
+        start = time.perf_counter()
         try:
             res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "AscendStore batch_get: keys=%d, bytes=%d, elapsed=%.2f ms, res=%s",
+                len(keys),
+                total_bytes,
+                elapsed_ms,
+                res,
+            )
             for value in res:
                 if value < 0:
                     logger.error("Failed to get key %s, res:%s", keys, res)
         except Exception as e:
-            logger.error("Failed to get key %s, error:%s", keys, e)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.error(
+                "AscendStore batch_get failed: keys=%d, bytes=%d, elapsed=%.2f ms, error=%s",
+                len(keys),
+                total_bytes,
+                elapsed_ms,
+                e,
+            )
 
 
 @dataclass

@@ -1170,6 +1170,10 @@ def _patch_kv_cache_manager_allocate_slots_for_diag() -> None:
         return result
 
     KVCacheManager.allocate_slots = _allocate_slots_with_diag
+    logger.info(
+        "KVCacheManager.allocate_slots PD-KV-transfer diag patch applied "
+        "(will log free_blocks/num_gpu_blocks when allocate_slots returns None)"
+    )
 
 
 class MooncakeConnectorScheduler:

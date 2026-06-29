@@ -1242,10 +1242,19 @@ class MooncakeConnectorScheduler:
         """
 
         params = request.kv_transfer_params
-        logger.debug(
-            "MooncakeConnector get_num_new_matched_tokens: num_computed_tokens=%s, kv_transfer_params=%s",
+        _rbid = params.get("remote_block_ids") if params is not None else None
+        logger.info(
+            "MooncakeConnector get_num_new_matched_tokens: request=%s, num_computed_tokens=%s, "
+            "do_remote_prefill=%s, remote_block_ids_type=%s, remote_block_ids_len=%s, "
+            "remote_block_ids_repr=%s, remote_engine_id=%s, kv_role=%s",
+            request.request_id,
             num_computed_tokens,
-            params,
+            params.get("do_remote_prefill") if params is not None else None,
+            type(_rbid).__name__,
+            len(_rbid) if _rbid is not None else None,
+            repr(_rbid)[:300],
+            params.get("remote_engine_id") if params is not None else None,
+            getattr(self, "kv_role", None),
         )
 
         if params is not None and params.get("do_remote_prefill"):
@@ -1273,13 +1282,16 @@ class MooncakeConnectorScheduler:
         remote_block_ids = params.get("remote_block_ids") if params is not None else None
         logger.info(
             "MooncakeConnector update_state_after_alloc: request=%s, num_external_tokens=%d, "
-            "do_remote_prefill=%s, has_remote_block_ids=%s, remote_block_ids_len=%s, is_hma=%s",
+            "do_remote_prefill=%s, has_remote_block_ids=%s, remote_block_ids_type=%s, "
+            "remote_block_ids_len=%s, remote_block_ids_repr=%s, is_hma=%s",
             request.request_id,
             num_external_tokens,
             params.get("do_remote_prefill") if params is not None else None,
             remote_block_ids is not None and bool(remote_block_ids),
+            type(remote_block_ids).__name__,
             sum(len(g) for g in remote_block_ids) if self.is_hma and remote_block_ids
             else (len(remote_block_ids) if remote_block_ids is not None else 0),
+            repr(remote_block_ids)[:300],
             self.is_hma,
         )
 
@@ -1313,7 +1325,16 @@ class MooncakeConnectorScheduler:
                 else:
                     logger.warning("Got invalid KVTransferParams: %s. This request will not utilize KVTransfer", params)
             else:
-                assert num_external_tokens == 0
+                if num_external_tokens != 0:
+                    logger.warning(
+                        "MooncakeConnector update_state_after_alloc: remote_block_ids is empty but "
+                        "num_external_tokens=%d != 0 (request=%s, is_hma=%s). Cannot pull KV. "
+                        "Clearing do_remote_prefill to avoid scheduling loop. "
+                        "Check P-node request_finished / proxy kv_transfer_params forwarding.",
+                        num_external_tokens,
+                        request.request_id,
+                        self.is_hma,
+                    )
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
 
@@ -1381,8 +1402,15 @@ class MooncakeConnectorScheduler:
         block_id_groups: BlockIdGroups,
     ) -> tuple[bool, dict[str, Any] | None]:
         params = request.kv_transfer_params
-        logger.debug(
-            "MooncakeConnector request_finished, request_status=%s, kv_transfer_params=%s", request.status, params
+        logger.info(
+            "MooncakeConnector request_finished(P-node): request=%s, status=%s, is_hma=%s, "
+            "do_remote_decode=%s, block_id_groups=%s, block_id_groups_len=%s",
+            request.request_id,
+            request.status,
+            self.is_hma,
+            params.get("do_remote_decode") if params is not None else None,
+            repr(block_id_groups)[:300],
+            [len(g) for g in block_id_groups] if block_id_groups else [],
         )
 
         if (
@@ -1410,6 +1438,15 @@ class MooncakeConnectorScheduler:
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
 
+        logger.info(
+            "MooncakeConnector request_finished(P-node) return: request=%s, delay_free_blocks=%s, "
+            "remote_block_ids_type=%s, remote_block_ids_len=%s, remote_block_ids_repr=%s",
+            request.request_id,
+            delay_free_blocks,
+            type(computed_block_ids).__name__,
+            sum(len(g) for g in computed_block_ids) if self.is_hma else len(computed_block_ids),
+            repr(computed_block_ids)[:300],
+        )
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,

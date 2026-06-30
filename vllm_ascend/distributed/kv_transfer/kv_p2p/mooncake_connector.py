@@ -602,7 +602,15 @@ class KVCacheRecvingThread(threading.Thread):
                 logger.warning("Skipping KV cache transfer for request. remote_request_id=%s. ", remote_request_id)
             else:
                 try:
-                    logger.debug("Starting to transfer KV cache for request %s.", remote_request_id)
+                    logger.info(
+                        "MooncakeConnector decode pull start: request=%s, remote_request=%s, "
+                        "remote_host=%s, remote_handshake_port=%s, tp_rank=%s",
+                        request_id,
+                        remote_request_id,
+                        remote_host,
+                        remote_handshake_port,
+                        self.tp_rank,
+                    )
                     self._transfer_kv_cache_all_groups(req_meta)
                     logger.debug("Finished transferring KV cache for request %s.", remote_request_id)
                 except Exception as e:
@@ -650,6 +658,12 @@ class KVCacheRecvingThread(threading.Thread):
         # P worker that we have the blocks we need.
         num_local_blocks = sum(len(group_block_ids) for group_block_ids in local_block_ids)
         if num_local_blocks == 0:
+            logger.info(
+                "MooncakeConnector decode pull skip: remote_request=%s, prefix cache hit "
+                "(no local blocks to pull), tp_rank=%s",
+                remote_request_id,
+                self.tp_rank,
+            )
             return
 
         # Check if we have the remote metadata cached.
@@ -810,6 +824,16 @@ class KVCacheRecvingThread(threading.Thread):
             src_list,
             dst_list,
             length_list,
+        )
+        total_bytes = sum(length_list)
+        logger.info(
+            "MooncakeConnector decode batch_transfer_sync_read: remote_request=%s, "
+            "blocks=%d, bytes=%d, session=%s, tp_rank=%s",
+            remote_request_id,
+            len(src_list),
+            total_bytes,
+            session_id,
+            self.tp_rank,
         )
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
@@ -1421,6 +1445,129 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         self.set_xfer_handshake_metadata(flat_metadata)
 
 
+_kv_transfer_alloc_diag_patched = False
+_mamba_block_aligned_split_patched = False
+
+
+def _patch_kv_cache_manager_allocate_slots_for_diag() -> None:
+    """Monkey-patch KVCacheManager.allocate_slots to log why a PD decode
+    request cannot be scheduled (returns None). Independent of which
+    scheduler implementation is in use (upstream Scheduler,
+    RecomputeScheduler, SchedulerDynamicBatch, ...).
+    """
+    global _kv_transfer_alloc_diag_patched
+    if _kv_transfer_alloc_diag_patched:
+        return
+    _kv_transfer_alloc_diag_patched = True
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    _orig_allocate_slots = KVCacheManager.allocate_slots
+
+    def _allocate_slots_with_diag(self, request, num_new_tokens, *args, **kwargs):
+        result = _orig_allocate_slots(self, request, num_new_tokens, *args, **kwargs)
+        if result is None:
+            num_ext = kwargs.get("num_external_computed_tokens", 0)
+            delay = kwargs.get("delay_cache_blocks", False)
+            if num_ext > 0 or delay:
+                try:
+                    logger.info(
+                        "KVCacheManager.allocate_slots returned None (PD KV transfer): "
+                        "request=%s, num_new_tokens=%d, num_external_computed_tokens=%d, "
+                        "delay_cache_blocks=%s, free_blocks=%d, num_gpu_blocks=%d",
+                        request.request_id,
+                        num_new_tokens,
+                        num_ext,
+                        delay,
+                        self.block_pool.get_num_free_blocks(),
+                        self.block_pool.num_gpu_blocks,
+                    )
+                except Exception as e:
+                    logger.info(
+                        "KVCacheManager.allocate_slots returned None (PD KV transfer): "
+                        "request=%s, num_new_tokens=%d, num_external_computed_tokens=%d "
+                        "(diag failed: %s)",
+                        request.request_id,
+                        num_new_tokens,
+                        num_ext,
+                        e,
+                    )
+        return result
+
+    KVCacheManager.allocate_slots = _allocate_slots_with_diag
+    logger.info(
+        "KVCacheManager.allocate_slots PD-KV-transfer diag patch applied "
+        "(will log free_blocks/num_gpu_blocks when allocate_slots returns None)"
+    )
+
+
+def _patch_scheduler_mamba_block_aligned_split_for_pd_kv() -> None:
+    """Monkey-patch Scheduler._mamba_block_aligned_split so PD disaggregation
+    works for hybrid (mamba + attention) models on vLLM 0.21.0.
+
+    vLLM 0.21.0's ``_mamba_block_aligned_split`` hard-asserts
+    ``num_external_computed_tokens == 0`` ("External KV connector is not
+    verified yet"). On the D node of a PD disaggregation, the scheduler calls
+    it with ``num_external_computed_tokens`` = number of remote prefill tokens
+    (e.g. 3602) and ``num_new_tokens == 0`` (load_kv_async), so:
+
+      1. the assert crashes the scheduler before ``allocate_slots`` /
+         ``update_state_after_alloc`` are reached (=> no pull requests,
+         do_remote_prefill never cleared => infinite decode-schedule loop);
+      2. even if the assert were removed, the caller breaks out of the
+         scheduling loop when ``num_new_tokens == 0`` is returned.
+
+    For a PD KV transfer step we do not need mamba block-aligned splitting at
+    all (the D node only pulls remote KV, it does not prefill). Skip the split
+    in that case and return a positive value so the scheduler proceeds to
+    ``allocate_slots`` / ``update_state_after_alloc``.
+    """
+    global _mamba_block_aligned_split_patched
+    if _mamba_block_aligned_split_patched:
+        return
+    _mamba_block_aligned_split_patched = True
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    _orig_split = Scheduler._mamba_block_aligned_split
+
+    def _split_with_pd_kv(
+        self,
+        request: "Request",
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        if num_external_computed_tokens > 0:
+            logger.info(
+                "MooncakeConnector skip _mamba_block_aligned_split for PD KV transfer: "
+                "request=%s, num_new_tokens=%d, num_new_local_computed_tokens=%d, "
+                "num_external_computed_tokens=%d",
+                request.request_id,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+            # Return a positive value so the scheduler's
+            # `if num_new_tokens == 0: break` does not skip allocate_slots.
+            # allocate_slots uses cdiv() so 1 extra token does not allocate an
+            # extra block for the existing computed/external range, and
+            # delay_cache_blocks=True (load_kv_async) skips caching, so this is
+            # safe for the PD pull step.
+            return max(num_new_tokens, 1)
+        return _orig_split(
+            self,
+            request,
+            num_new_tokens,
+            num_new_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+
+    Scheduler._mamba_block_aligned_split = _split_with_pd_kv
+    logger.info(
+        "Scheduler._mamba_block_aligned_split PD-KV-transfer patch applied "
+        "(skips assert/split when num_external_computed_tokens > 0)"
+    )
+
+
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
@@ -1433,6 +1580,8 @@ class MooncakeConnectorScheduler:
         self.engine_id = engine_id
         self.local_ip = get_ip()
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
+        _patch_kv_cache_manager_allocate_slots_for_diag()
+        _patch_scheduler_mamba_block_aligned_split_for_pd_kv()
 
         self.side_channel_host = get_ip()
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
@@ -1594,10 +1743,19 @@ class MooncakeConnectorScheduler:
         """
 
         params = request.kv_transfer_params
-        logger.debug(
-            "MooncakeConnector get_num_new_matched_tokens: num_computed_tokens=%s, kv_transfer_params=%s",
+        _rbid = params.get("remote_block_ids") if params is not None else None
+        logger.info(
+            "MooncakeConnector get_num_new_matched_tokens: request=%s, num_computed_tokens=%s, "
+            "do_remote_prefill=%s, remote_block_ids_type=%s, remote_block_ids_len=%s, "
+            "remote_block_ids_repr=%s, remote_engine_id=%s, kv_role=%s",
+            request.request_id,
             num_computed_tokens,
-            params,
+            params.get("do_remote_prefill") if params is not None else None,
+            type(_rbid).__name__,
+            len(_rbid) if _rbid is not None else None,
+            repr(_rbid)[:300],
+            params.get("remote_engine_id") if params is not None else None,
+            getattr(self, "kv_role", None),
         )
 
         if params is not None and params.get("do_remote_prefill"):
@@ -1607,6 +1765,15 @@ class MooncakeConnectorScheduler:
             params["num_computed_tokens"] = num_computed_tokens
             count = max(actual - num_computed_tokens, 0)
             if count > 0:
+                logger.info(
+                    "MooncakeConnector decode schedule: request=%s, external_tokens=%d, "
+                    "num_computed_tokens=%d, remote_engine_id=%s, remote_request_id=%s",
+                    request.request_id,
+                    count,
+                    num_computed_tokens,
+                    params.get("remote_engine_id"),
+                    params.get("remote_request_id"),
+                )
                 return count, True
 
         if params is not None and params.get("do_remote_decode") and self.need_truncate:
@@ -1617,10 +1784,19 @@ class MooncakeConnectorScheduler:
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         params = request.kv_transfer_params
-        logger.debug(
-            "MooncakeConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
+        remote_block_ids = params.get("remote_block_ids") if params is not None else None
+        logger.info(
+            "MooncakeConnector update_state_after_alloc: request=%s, num_external_tokens=%d, "
+            "do_remote_prefill=%s, has_remote_block_ids=%s, remote_block_ids_type=%s, "
+            "remote_block_ids_len=%s, remote_block_ids_repr=%s, use_hybrid=%s",
+            request.request_id,
             num_external_tokens,
-            params,
+            params.get("do_remote_prefill") if params is not None else None,
+            remote_block_ids is not None and bool(remote_block_ids),
+            type(remote_block_ids).__name__,
+            len(remote_block_ids) if remote_block_ids is not None else 0,
+            repr(remote_block_ids)[:300],
+            self.use_hybrid,
         )
 
         if params is not None and (params.get("do_remote_prefill", False) or params.get("do_remote_decode", False)):
@@ -1631,10 +1807,29 @@ class MooncakeConnectorScheduler:
                     local_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else []
                     # Get unhashed blocks to pull from remote.
                     self._reqs_need_recv[request.request_id] = (request, local_block_ids, num_external_tokens)
+                    logger.info(
+                        "MooncakeConnector decode alloc: request=%s, num_external_tokens=%d, "
+                        "local_blocks=%d, remote_blocks=%d, remote_host=%s, remote_port=%s",
+                        request.request_id,
+                        num_external_tokens,
+                        sum(len(g) for g in local_block_ids) if local_block_ids else 0,
+                        len(params.get("remote_block_ids", [])),
+                        params.get("remote_host"),
+                        params.get("remote_port"),
+                    )
                 else:
                     logger.warning("Got invalid KVTransferParams. params=%s. ", params)
             else:
-                assert num_external_tokens == 0
+                if num_external_tokens != 0:
+                    logger.warning(
+                        "MooncakeConnector update_state_after_alloc: remote_block_ids is empty but "
+                        "num_external_tokens=%d != 0 (request=%s, use_hybrid=%s). Cannot pull KV. "
+                        "Clearing do_remote_prefill to avoid scheduling loop. "
+                        "Check P-node request_finished / proxy kv_transfer_params forwarding.",
+                        num_external_tokens,
+                        request.request_id,
+                        self.use_hybrid,
+                    )
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
 
@@ -1650,6 +1845,14 @@ class MooncakeConnectorScheduler:
             # For the case where there are no remote blocks to pull
             # (block_ids is empty), we don't need to schedule
             # an async read on the worker side.
+            logger.info(
+                "MooncakeConnector decode build_meta: request=%s, num_external_tokens=%d, "
+                "local_blocks=%d, remote_blocks=%d",
+                req_id,
+                num_external_tokens,
+                sum(len(g) for g in block_ids) if block_ids else 0,
+                len(req.kv_transfer_params.get("remote_block_ids", [])),
+            )
             meta.add_new_req(
                 request_id=req_id,
                 local_block_ids=block_ids,
@@ -1677,8 +1880,14 @@ class MooncakeConnectorScheduler:
         """
 
         params = request.kv_transfer_params
-        logger.debug(
-            "MooncakeConnector request_finished, request_status=%s, kv_transfer_params=%s", request.status, params
+        logger.info(
+            "MooncakeConnector request_finished(P-node): request=%s, status=%s, use_hybrid=%s, "
+            "do_remote_decode=%s, block_ids_repr=%s",
+            request.request_id,
+            request.status,
+            self.use_hybrid,
+            params.get("do_remote_decode") if params is not None else None,
+            repr(block_ids)[:300],
         )
 
         if (
@@ -1697,6 +1906,15 @@ class MooncakeConnectorScheduler:
             logger.info("Delaying free of %d blocks for request %s", sum(computed_block_lens), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
 
+        logger.info(
+            "MooncakeConnector request_finished(P-node) return: request=%s, delay_free_blocks=%s, "
+            "computed_block_ids_type=%s, computed_block_ids_len=%s, computed_block_ids_repr=%s",
+            request.request_id,
+            delay_free_blocks,
+            type(computed_block_ids).__name__,
+            sum(len(g) for g in computed_block_ids) if computed_block_ids else 0,
+            repr(computed_block_ids)[:300],
+        )
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,
@@ -2561,6 +2779,18 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
+        if not metadata.requests:
+            logger.debug(
+                "MooncakeConnector decode start_load_kv: no pull requests in metadata, tp_rank=%s",
+                self.tp_rank,
+            )
+        else:
+            logger.info(
+                "MooncakeConnector decode start_load_kv: %d request(s), tp_rank=%s, req_ids=%s",
+                len(metadata.requests),
+                self.tp_rank,
+                list(metadata.requests.keys()),
+            )
         for req_id in metadata.reqs_in_batch:
             if self.kv_send_thread is not None:
                 self.kv_send_thread.task_tracker.add_req_to_process(req_id)
@@ -2568,15 +2798,19 @@ class MooncakeConnectorWorker:
                 self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
 
         for req_id, meta in metadata.requests.items():
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "start_load_kv for request %s from remote engine %s. "
-                    "Num local_block_ids: %s. Num remote_block_ids: %s. ",
-                    req_id,
-                    meta.remote_engine_id,
-                    len(meta.local_block_ids),
-                    len(meta.remote_block_ids),
-                )
+            logger.info(
+                "MooncakeConnector decode start_load_kv: request=%s, remote_request=%s, "
+                "remote_engine=%s, remote_host=%s, remote_port=%s, "
+                "local_blocks=%s, remote_blocks=%s, external_tokens=%s",
+                req_id,
+                meta.remote_request_id,
+                meta.remote_engine_id,
+                meta.remote_host,
+                meta.remote_port,
+                meta.local_block_ids,
+                meta.remote_block_ids,
+                meta.num_external_tokens,
+            )
 
             remote_req_id = meta.remote_request_id
             prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size

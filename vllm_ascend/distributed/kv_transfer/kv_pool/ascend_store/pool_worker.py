@@ -484,6 +484,14 @@ class KVPoolWorker:
         self.current_layer = 0
         self.layerwise_retrievers = []
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
+        load_requests = [r for r in metadata.requests if r.load_spec is not None and r.load_spec.can_load]
+        if load_requests:
+            logger.info(
+                "AscendStore decode start_load_kv: %d loadable request(s), tp_rank=%s, req_ids=%s",
+                len(load_requests),
+                self.tp_rank,
+                [r.req_id for r in load_requests],
+            )
         for request in metadata.requests:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:  # load =0
@@ -493,6 +501,14 @@ class KVPoolWorker:
                     "no_load_spec" if load_spec is None else f"can_load={load_spec.can_load}",
                 )
                 continue
+            logger.info(
+                "AscendStore decode start_load_kv: request=%s, kvpool_tokens=%d, "
+                "vllm_cached_tokens=%d, token_len_chunk=%d",
+                request.req_id,
+                load_spec.kvpool_cached_tokens,
+                load_spec.vllm_cached_tokens,
+                request.token_len_chunk,
+            )
             request.skip_null_blocks_by_group = self.group_uses_align_state
             load_group_ids = request.kv_cache_group_ids or [0]
             token_len = request.token_len_chunk

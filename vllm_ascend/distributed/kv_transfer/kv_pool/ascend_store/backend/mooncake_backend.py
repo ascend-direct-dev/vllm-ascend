@@ -3,6 +3,7 @@ import functools
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,6 +69,11 @@ class MooncakeBackend(Backend):
         self.store: Any | None = None
         self.local_seg: str | None = None
         self._use_fabric_mem = os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") == "1"
+        # ASCEND_GLOBAL_RESOURCE_CONFIG: dual-protocol / RoCE Store path; shares the
+        # fabric-mem store.setup path (no global TE in setup) but, unlike fabric_mem,
+        # local buffers are registered via the Mooncake store rather than skipped.
+        self._use_global_resource_config = bool(os.getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
+        self._use_fabric_mem_setup = self._use_fabric_mem or self._use_global_resource_config
         self._lazy_init = lazy_init and self._use_fabric_mem
         self._store_initialized = False
         self._store_init_lock = threading.Lock()
@@ -114,7 +120,7 @@ class MooncakeBackend(Backend):
         # ASCEND_ENABLE_USE_FABRIC_MEM: Enable unified memory address direct transmission scheme
         # and only can be used for 800 I/T A3 series.
         # Required supporting hardware versions are as follows:
-        if not self._use_fabric_mem:
+        if not self._use_fabric_mem_setup:
             transfer_engine = global_te.get_transfer_engine(local_hostname, device_name=None)
             self.local_seg = local_hostname + ":" + str(transfer_engine.get_rpc_port())
             ret = store.setup(
@@ -130,6 +136,17 @@ class MooncakeBackend(Backend):
             )
         else:
             self.local_seg = local_hostname
+            if self._use_global_resource_config:
+                logger.info(
+                    "Mooncake setup with ASCEND_GLOBAL_RESOURCE_CONFIG: "
+                    "local_seg=%s, local buffers will be registered via store",
+                    self.local_seg,
+                )
+            else:
+                logger.info(
+                    "Mooncake setup with ASCEND_ENABLE_USE_FABRIC_MEM: local_seg=%s",
+                    self.local_seg,
+                )
             ret = store.setup(
                 local_hostname=self.local_seg,
                 metadata_server=self.config.metadata_server,
@@ -162,7 +179,22 @@ class MooncakeBackend(Backend):
         torch.npu.set_device(device)
 
     def register_buffer(self, ptrs: list[int], lengths: list[int]):
-        if not self._use_fabric_mem:
+        if self._use_global_resource_config:
+            assert self.store is not None
+            logger.info(
+                "Registering %d buffer(s) via Mooncake store (ASCEND_GLOBAL_RESOURCE_CONFIG)",
+                len(ptrs),
+            )
+            for ptr, length in zip(ptrs, lengths):
+                ret = self.store.register_buffer(ptr, length)
+                if ret != 0:
+                    logger.error(
+                        "Failed to register buffer via store: ptr=%s, length=%s, ret=%s",
+                        ptr,
+                        length,
+                        ret,
+                    )
+        elif not self._use_fabric_mem:
             local_hostname = get_ip()
             global_te.get_transfer_engine(local_hostname, device_name=None)
             global_te.register_buffer(ptrs, lengths)
@@ -185,7 +217,17 @@ class MooncakeBackend(Backend):
             if self.config.preferred_segment:
                 config.preferred_segment = self.local_seg
             config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
+            total_bytes = sum(sum(batch_sizes) for batch_sizes in sizes)
+            start = time.perf_counter()
             res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "AscendStore batch_put: keys=%d, bytes=%d, elapsed=%.2f ms, res=%s",
+                len(keys),
+                total_bytes,
+                elapsed_ms,
+                res,
+            )
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -200,10 +242,13 @@ class MooncakeBackend(Backend):
                 if self._lazy_init:
                     logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
         except Exception as e:
+            elapsed_ms = (time.perf_counter() - start) * 1000
             logger.error(
-                "Failed to put %d keys out of %d. Check store state and memory.",
+                "AscendStore batch_put failed: keys=%d, bytes=%d, elapsed=%.2f ms, error=%s",
                 len(keys),
-                len(keys),
+                total_bytes,
+                elapsed_ms,
+                e,
             )
             logger.debug(
                 "Failed to put key details. keys=%s, type=%s, error=%s",
@@ -230,8 +275,18 @@ class MooncakeBackend(Backend):
             len(keys),
             keys[:3],
         )
+        total_bytes = sum(sum(batch_sizes) for batch_sizes in sizes)
+        start = time.perf_counter()
         try:
             res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "AscendStore batch_get: keys=%d, bytes=%d, elapsed=%.2f ms, res=%s",
+                len(keys),
+                total_bytes,
+                elapsed_ms,
+                res,
+            )
             res_list = list(res)
             failed_codes = [int(value) for value in res_list if value < 0]
             failed_count = len(failed_codes)
@@ -249,10 +304,13 @@ class MooncakeBackend(Backend):
                     res_list[i] = 0
             return res_list
         except Exception as e:
+            elapsed_ms = (time.perf_counter() - start) * 1000
             logger.error(
-                "Failed to get %d keys out of %d. Check store state and network.",
+                "AscendStore batch_get failed: keys=%d, bytes=%d, elapsed=%.2f ms, error=%s",
                 len(keys),
-                len(keys),
+                total_bytes,
+                elapsed_ms,
+                e,
             )
             logger.debug(
                 "Failed to get key details. keys=%s, type=%s, error=%s",
